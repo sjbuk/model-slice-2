@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from meshpartition.mesh import RawMesh
 from meshpartition.stage0 import default_tolerances, ingest
 from meshpartition.util import triangle_areas
 
@@ -104,6 +105,32 @@ def test_0_4_non_manifold_survival():
     incident_faces = working.edge_faces[tjunction_edge]
     assert len(incident_faces) == 3
     assert len(set(incident_faces)) == 3  # distinct face ids, not duplicates
+
+
+def test_0_6_post_weld_degenerate_purge():
+    """A face can be non-degenerate pre-weld yet collapse to <=2 distinct
+    vertices once two close-but-distinct corners are welded together (thin
+    slivers common in dense/sculpted meshes). Stage 0 must purge these
+    post-weld degenerate faces too -- otherwise Stage 4 later crashes
+    looking for a third "opposite" vertex on a face that no longer has one.
+    """
+    anchor = np.array([[0.0, 0.0, 0.0], [100.0, 0.0, 0.0], [0.0, 100.0, 0.0]])
+    # Corners 3 and 4 are 2e-4 apart -- inside delta_weld (1e-3) so they weld
+    # together, collapsing this triangle onto 2 distinct vertices. Its area
+    # pre-weld (~1e-3) is comfortably above epsilon_area (1e-6), so the
+    # pre-weld purge lets it through untouched.
+    sliver = np.array([[50.0, 50.0, 0.0], [50.0 + 2e-4, 50.0, 0.0], [50.0, 50.0, 10.0]])
+    positions = np.concatenate([anchor, sliver], axis=0)
+    faces_pos = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+    raw = RawMesh(positions=positions, faces_pos=faces_pos)
+
+    working, stats = ingest(raw, delta_weld=1e-3, epsilon_area=1e-6)
+
+    assert working.face_count == 1, "the post-weld-collapsed sliver must be purged"
+    assert stats.degenerate_face_count == 1
+
+    relative_delta = abs(stats.area_after - stats.area_before) / stats.area_before
+    assert relative_delta < 1e-6
 
 
 @pytest.mark.parametrize("name", sorted(ALL_FIXTURES))

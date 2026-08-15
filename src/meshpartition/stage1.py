@@ -67,6 +67,10 @@ def _component_centroid(
     mask = face_component_id == comp_id
     weights = working.face_areas[mask]
     points = working.face_centroids[mask]
+    if weights.sum() <= 0.0:
+        # All faces in this component are degenerate (zero area) -- fall back
+        # to a plain average since area weighting is undefined.
+        return points.mean(axis=0)
     return np.average(points, axis=0, weights=weights)
 
 

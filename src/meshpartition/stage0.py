@@ -134,6 +134,23 @@ def ingest(
     corner_positions = welded_positions[welded_faces_pos]
     face_areas = triangle_areas(corner_positions)
     face_centroids = triangle_centroids(corner_positions)
+
+    # Welding can pull two of a face's three corners together even when the
+    # face was non-degenerate pre-weld (thin slivers with two near-coincident
+    # vertices), collapsing it onto <=2 distinct welded vertices. Such a face
+    # would otherwise be registered against an edge with no third, "opposite"
+    # vertex, breaking Stage 4's dual graph construction. Purge it here too.
+    post_weld_keep = face_areas >= epsilon_area
+    post_weld_degenerate_count = int(np.sum(~post_weld_keep))
+
+    welded_faces_pos = welded_faces_pos[post_weld_keep]
+    face_areas = face_areas[post_weld_keep]
+    face_centroids = face_centroids[post_weld_keep]
+    material_ids = purged.material_ids[post_weld_keep]
+    faces_uv = None if purged.faces_uv is None else purged.faces_uv[post_weld_keep]
+    faces_normal = None if purged.faces_normal is None else purged.faces_normal[post_weld_keep]
+    kept_original_face_indices = kept_original_face_indices[post_weld_keep]
+
     area_after = float(np.sum(face_areas))
 
     edge_faces, boundary_edges, nonmanifold_edges = _build_adjacency(welded_faces_pos)
@@ -142,10 +159,10 @@ def ingest(
         positions=welded_positions,
         faces_pos=welded_faces_pos,
         uvs=purged.uvs,
-        faces_uv=purged.faces_uv,
+        faces_uv=faces_uv,
         normals=purged.normals,
-        faces_normal=purged.faces_normal,
-        material_ids=purged.material_ids,
+        faces_normal=faces_normal,
+        material_ids=material_ids,
         face_areas=face_areas,
         face_centroids=face_centroids,
         edge_faces=edge_faces,
@@ -157,7 +174,7 @@ def ingest(
 
     stats = IngestStats(
         original_face_count=raw.face_count,
-        degenerate_face_count=degenerate_count,
+        degenerate_face_count=degenerate_count + post_weld_degenerate_count,
         surviving_face_count=working.face_count,
         original_vertex_count=len(raw.positions),
         welded_vertex_count=working.vertex_count,

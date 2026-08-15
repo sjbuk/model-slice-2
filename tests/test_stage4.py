@@ -23,6 +23,27 @@ def _build_graph(fixture_fn, n_pieces=5):
     return working, graph
 
 
+def test_4_0_post_weld_degenerate_face_does_not_crash():
+    """Regression test for the web UI crash: 'face N does not contain edge
+    (u, v)'. A face that collapses to <=2 distinct vertices post-weld (see
+    test_0_6_post_weld_degenerate_purge in test_stage0.py) must be purged by
+    Stage 0 before it ever reaches Stage 4 -- otherwise build_dual_graph
+    tries to look up a third, "opposite" vertex on a face that no longer has
+    one and raises.
+    """
+    anchor = np.array([[0.0, 0.0, 0.0], [100.0, 0.0, 0.0], [0.0, 100.0, 0.0]])
+    sliver = np.array([[50.0, 50.0, 0.0], [50.0 + 2e-4, 50.0, 0.0], [50.0, 50.0, 10.0]])
+    positions = np.concatenate([anchor, sliver], axis=0)
+    faces_pos = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+    raw = RawMesh(positions=positions, faces_pos=faces_pos)
+
+    working, _ = ingest(raw, delta_weld=1e-3, epsilon_area=1e-6)
+    result = triage(working, n_pieces=1)
+    bridges = build_bridges(working, result)
+
+    build_dual_graph(working, bridges)  # must not raise
+
+
 @pytest.mark.parametrize("name", sorted(ALL_FIXTURES))
 def test_4_1_symmetry(name):
     """4.1 -- every edge U->V has a matching V->U entry with exactly equal cost."""
