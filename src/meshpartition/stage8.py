@@ -32,16 +32,17 @@ whole score). Lower is better.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra
 
 from .mesh import WorkingMesh
 from .stage1 import TriageResult
 from .stage2 import BridgeResult
 from .stage4 import DualGraph
-from .stage5 import SeedResult, _multi_source_distances
+from .stage5 import SeedResult
 from .stage6 import GrowthResult, grow
 from .stage7 import DEFAULT_GAMMA, RepairResult, repair
 from .util import bbox_diagonal
@@ -124,16 +125,30 @@ def _region_adjacency(dual_graph: DualGraph, label: np.ndarray, region_id: int) 
     return adjacency
 
 
-def _medoid(adjacency: dict[int, list[tuple[int, float]]]) -> int:
+def _region_csr(adjacency: dict[int, list[tuple[int, float]]]) -> tuple[csr_matrix, list[int]]:
     faces = sorted(adjacency.keys())
-    best_face = faces[0]
-    best_total = math.inf
-    for f in faces:
-        total = sum(_multi_source_distances(adjacency, [f]).values())
-        if total < best_total:
-            best_total = total
-            best_face = f
-    return best_face
+    local_index = {f: i for i, f in enumerate(faces)}
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+    for f, neighbors in adjacency.items():
+        for neighbor, cost in neighbors:
+            rows.append(local_index[f])
+            cols.append(local_index[neighbor])
+            data.append(cost)
+    n = len(faces)
+    csr = csr_matrix((data, (rows, cols)), shape=(n, n))
+    return csr, faces
+
+
+def _medoid(adjacency: dict[int, list[tuple[int, float]]]) -> int:
+    csr, faces = _region_csr(adjacency)
+    # adjacency already carries both directions of every edge (see build_dual_graph),
+    # so directed=True over those explicit reciprocal entries gives correct
+    # undirected distances without scipy needing to symmetrize the matrix itself.
+    distances = dijkstra(csr, directed=True)
+    totals = distances.sum(axis=1)
+    return faces[int(np.argmin(totals))]
 
 
 def _reseed(seed_result: SeedResult, new_seed_faces: list[int]) -> SeedResult:

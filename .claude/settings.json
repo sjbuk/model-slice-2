@@ -44,7 +44,8 @@
       "Bash(python scripts/run_pipeline.py models/spot.obj 6)",
       "Bash(python \"C:\\\\Users\\\\stuar\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\d--Unity-JigSaw2\\\\bfce071f-c439-435c-9617-6effc57bf495\\\\scratchpad\\\\test_standalone_uv.py\")",
       "Bash(assimp version *)",
-      "Bash(python -m pytest tests/ -v)"
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(python scripts/run_pipeline.py models/stanford-bunny.obj 24)"
     ]
   }
 }
