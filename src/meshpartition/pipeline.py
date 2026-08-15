@@ -29,10 +29,10 @@ class PipelineResult:
     pieces: list[RawMesh]
 
 
-def run_pipeline(raw: RawMesh, n_pieces: int) -> PipelineResult:
+def run_pipeline(raw: RawMesh, n_pieces: int, force_exact_count: bool = False) -> PipelineResult:
     working, stats = ingest(raw)
     tri = triage(working, n_pieces=n_pieces)
-    bridges = build_bridges(working, tri)
+    bridges = build_bridges(working, tri, force_exact_count=force_exact_count)
     graph = build_dual_graph(working, bridges)
     seed_result = seed(graph, tri, bridges)
     growth = grow(working, graph, seed_result, abar=tri.abar)

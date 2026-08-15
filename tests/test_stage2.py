@@ -110,3 +110,31 @@ def test_2_4_anchor_termination():
 
     for satellite, anchor in bridges.anchors.items():
         assert anchor.other_component in result.major_ids
+
+
+def test_2_5_force_exact_count():
+    """force_exact_count=True force-adopts the nearest-centroid host instead
+    of promoting -- same setup as 2.1 (button moved 10m away), but the
+    button now bridges (with forced=True) rather than becoming its own
+    major. Default behavior (2.1) is unaffected -- force_exact_count is
+    opt-in per call.
+    """
+    raw = fixture_c_shirt()
+    working, _ = ingest(raw)
+    result = triage(working, n_pieces=5)
+
+    far_positions = working.positions.copy()
+    far_satellite = result.satellite_ids[0]
+    far_faces = np.unique(working.faces_pos[result.face_component_id == far_satellite])
+    far_positions[far_faces] += np.array([10.0, 0.0, 0.0])
+
+    moved_raw = RawMesh(positions=far_positions, faces_pos=working.faces_pos)
+    moved_working, _ = ingest(moved_raw)
+    moved_result = triage(moved_working, n_pieces=5)
+
+    bridges = build_bridges(moved_working, moved_result, force_exact_count=True)
+
+    assert far_satellite not in bridges.promoted_ids
+    assert far_satellite in bridges.satellite_ids
+    assert bridges.anchors[far_satellite].forced
+    assert bridges.anchors[far_satellite].other_component == moved_result.satellite_host[far_satellite]

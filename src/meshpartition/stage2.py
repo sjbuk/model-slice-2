@@ -34,7 +34,16 @@ from .util import (
     generalized_winding_number,
 )
 
-DEFAULT_C_TAU = 0.5
+# c_tau=0.5 rejects real, flush-fitting detail parts (lens layers, rivets,
+# trim discs -- common in hard-surface assets that were never vertex-welded
+# across material boundaries): a small satellite's own bbox diagonal can be
+# on the same order as its unwelded seam gap, so a gap allowance of half its
+# own size is tighter than the model's overall scale would justify. 1.25
+# still lets the global cap (tau_max_fraction) be the real backstop against
+# satellites that are actually far away, in local-size terms as well as
+# global (Stage 2.1's spec case: a button moved 10m off a ~1m-diagonal shirt
+# stays promoted at any c_tau in this range, since 10m dwarfs both terms).
+DEFAULT_C_TAU = 1.25
 DEFAULT_TAU_MAX_FRACTION = 0.03
 DEFAULT_M = 5
 DEFAULT_THETA_N = 0.0
@@ -50,6 +59,7 @@ class BridgeEdge:
     distance: float
     normal_agreement: float
     via_enclosure: bool = False
+    forced: bool = False  # force_exact_count fallback: nearest-centroid host, no gap/normal check
 
 
 @dataclass
@@ -120,7 +130,17 @@ def build_bridges(
     tau_max_fraction: float = DEFAULT_TAU_MAX_FRACTION,
     theta_n: float = DEFAULT_THETA_N,
     enclosure_threshold: float = DEFAULT_ENCLOSURE_THRESHOLD,
+    force_exact_count: bool = False,
 ) -> BridgeResult:
+    """force_exact_count=True disables promotion: a satellite that fails the
+    gap/normal-agreement test force-adopts Stage 1's provisional
+    nearest-centroid host instead of becoming its own major. This trades
+    bridge plausibility for an exact N -- appropriate when pieces never need
+    to read as physically/visually coherent on their own (e.g. VR puzzle
+    pieces are just grouped geometry, not objects that must look sensibly
+    assembled from any single piece's silhouette). Default behavior
+    (promotion) is unchanged; this is opt-in per call.
+    """
     normals = face_normals(working.face_corner_positions())
     global_bbox_diag = bbox_diagonal(working.positions)
     face_component_id = triage.face_component_id
@@ -194,8 +214,27 @@ def build_bridges(
         if survivors:
             bridges[satellite] = survivors
             anchors[satellite] = min(survivors, key=lambda e: e.distance)
-        else:
-            promoted_ids.append(satellite)
+            continue
+
+        if force_exact_count:
+            host = triage.satellite_host[satellite]
+            host_faces = major_face_masks[host]
+            forced_hits = _nearest_distinct_hits(working, normals, satellite_faces, host_faces, m=1)
+            dist, sat_face, other_face, agreement = forced_hits[0]
+            anchor = BridgeEdge(
+                satellite_component=satellite,
+                satellite_face=sat_face,
+                other_component=host,
+                other_face=other_face,
+                distance=dist,
+                normal_agreement=agreement,
+                forced=True,
+            )
+            bridges[satellite] = [anchor]
+            anchors[satellite] = anchor
+            continue
+
+        promoted_ids.append(satellite)
 
     updated_major_ids = sorted(triage.major_ids + promoted_ids)
     updated_satellite_ids = [s for s in triage.satellite_ids if s not in promoted_ids]

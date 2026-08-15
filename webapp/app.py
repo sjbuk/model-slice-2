@@ -67,6 +67,8 @@ def slice_model():
     if n_pieces < 2:
         return jsonify(error="n_pieces must be at least 2."), 400
 
+    force_exact_count = request.form.get("force_exact_count", "").lower() in ("1", "true", "on")
+
     job_id = uuid.uuid4().hex[:12]
     job_dir = OUTPUT_ROOT / job_id
     job_dir.mkdir(parents=True)
@@ -92,7 +94,14 @@ def slice_model():
             return jsonify(error=str(exc)), 422
 
     proc = subprocess.Popen(
-        [sys.executable, str(WORKER_SCRIPT), str(pipeline_obj), str(n_pieces), str(job_dir)]
+        [
+            sys.executable,
+            str(WORKER_SCRIPT),
+            str(pipeline_obj),
+            str(n_pieces),
+            str(job_dir),
+            "1" if force_exact_count else "0",
+        ]
     )
     with JOBS_LOCK:
         JOBS[job_id] = {

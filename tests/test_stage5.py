@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
+from meshpartition.mesh import RawMesh
 from meshpartition.stage0 import ingest
 from meshpartition.stage1 import triage
 from meshpartition.stage2 import build_bridges
 from meshpartition.stage4 import build_dual_graph
 from meshpartition.stage5 import seed
 
-from fixtures import ALL_FIXTURES, fixture_a_sphere
+from fixtures import ALL_FIXTURES, fixture_a_sphere, fixture_c_shirt
 
 # Kept small enough that every fixture's smallest major component (Fixture
 # D's two-triangle decoy floor) still has enough distinct faces to seat its
@@ -52,3 +54,32 @@ def test_5_3_determinism():
     first = runs[0].seeds
     for other in runs[1:]:
         assert other.seeds == first
+
+
+def test_5_4_infeasibility_after_promotion():
+    """5.4 -- when Stage 2 promotes enough satellites that majors outnumber N,
+    seeding raises rather than silently returning more pieces than requested
+    (Stage 1's own too-few-N guard only sees pre-promotion majors, so this
+    has to be re-checked here once promotion is known).
+    """
+    working, _ = ingest(fixture_c_shirt())
+    result = triage(working, n_pieces=2)
+    assert len(result.major_ids) == 1  # only the torso -- fits under N=2 pre-promotion
+
+    # Move every button far enough away (in distinct directions, so none can
+    # bridge to another moved button's new neighborhood either) that none
+    # finds a valid bridge back to the torso.
+    far_positions = working.positions.copy()
+    for offset, satellite in enumerate(result.satellite_ids, start=1):
+        sat_verts = np.unique(working.faces_pos[result.face_component_id == satellite])
+        far_positions[sat_verts] += np.array([10.0 * offset, 0.0, 0.0])
+
+    moved_working, _ = ingest(RawMesh(positions=far_positions, faces_pos=working.faces_pos))
+    moved_result = triage(moved_working, n_pieces=2)
+    bridges = build_bridges(moved_working, moved_result)
+    assert len(bridges.promoted_ids) == 3
+    assert len(bridges.major_ids) == 4  # torso + 3 promoted buttons, > N=2
+
+    graph = build_dual_graph(moved_working, bridges)
+    with pytest.raises(ValueError, match="too low"):
+        seed(graph, moved_result, bridges)

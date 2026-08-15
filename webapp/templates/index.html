@@ -63,6 +63,9 @@
   <form id="sliceForm">
     <label>Model: <input type="file" id="modelFile" accept=".fbx,.glb,.obj" required></label>
     <label>Pieces: <input type="number" id="nPieces" value="8" min="2" max="200"></label>
+    <label title="Force exactly this many pieces by merging every disconnected part into its nearest piece, even across large real-world gaps. Off by default: pieces that can't plausibly merge become their own extra piece instead.">
+      <input type="checkbox" id="forceExactCount"> Force exact count
+    </label>
     <button type="submit" id="sliceBtn">Slice</button>
   </form>
 </header>
@@ -372,6 +375,7 @@ form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const fileInput = document.getElementById('modelFile');
   const nPieces = document.getElementById('nPieces').value;
+  const forceExactCount = document.getElementById('forceExactCount').checked;
   if (!fileInput.files.length) return;
 
   stopPolling();
@@ -382,6 +386,7 @@ form.addEventListener('submit', async (e) => {
   const fd = new FormData();
   fd.append('model', fileInput.files[0]);
   fd.append('n_pieces', nPieces);
+  fd.append('force_exact_count', forceExactCount ? '1' : '0');
 
   try {
     const resp = await fetch('/api/slice', { method: 'POST', body: fd });

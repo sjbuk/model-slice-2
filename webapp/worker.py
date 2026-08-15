@@ -22,12 +22,13 @@ from meshpartition.stage10 import write_preview_obj
 
 def main() -> None:
     obj_path, n_pieces, job_dir = sys.argv[1], int(sys.argv[2]), Path(sys.argv[3])
+    force_exact_count = len(sys.argv) > 4 and sys.argv[4] == "1"
     result_path = job_dir / "result.json"
 
     try:
         raw = load_obj(obj_path)
         t0 = time.perf_counter()
-        result = run_pipeline(raw, n_pieces=n_pieces)
+        result = run_pipeline(raw, n_pieces=n_pieces, force_exact_count=force_exact_count)
         elapsed = time.perf_counter() - t0
 
         for i, piece in enumerate(result.pieces):
@@ -53,6 +54,7 @@ def main() -> None:
             "status": "done",
             "elapsed_seconds": round(elapsed, 2),
             "source_faces": raw.face_count,
+            "force_exact_count": force_exact_count,
             "converged": result.relaxed.converged,
             "max_area_deviation": result.relaxed.max_area_deviation,
             "iterations_run": result.relaxed.iterations_run,

@@ -2,7 +2,15 @@
 report the result. Stage 9 (seam fairing) is not implemented yet; Stage 10
 (extraction) is implemented in part -- just enough to write per-piece OBJs.
 
-Usage: python scripts/run_pipeline.py <path-to-obj> [n_pieces]
+Usage: python scripts/run_pipeline.py <path-to-obj> [n_pieces] [--force-exact-count]
+
+--force-exact-count disables satellite promotion: components that can't find
+a plausible bridge are force-adopted by their nearest major instead of
+becoming their own piece, so the run always lands on exactly n_pieces
+(assuming n_pieces >= the number of true major components). Use this when
+piece count matters more than every piece being a plausible physical/visual
+grouping -- e.g. VR puzzle pieces that never need to look assembled on their
+own. Default (off) keeps promotion, which can require more than n_pieces.
 """
 
 from __future__ import annotations
@@ -19,8 +27,10 @@ from meshpartition.stage10 import write_preview_obj
 
 
 def main() -> None:
-    obj_path = sys.argv[1] if len(sys.argv) > 1 else "models/stanford-bunny.obj"
-    n_pieces = int(sys.argv[2]) if len(sys.argv) > 2 else 8
+    force_exact_count = "--force-exact-count" in sys.argv
+    positional = [a for a in sys.argv[1:] if not a.startswith("--")]
+    obj_path = positional[0] if len(positional) > 0 else "models/stanford-bunny.obj"
+    n_pieces = int(positional[1]) if len(positional) > 1 else 8
 
     t0 = time.perf_counter()
 
@@ -28,8 +38,8 @@ def main() -> None:
     raw = load_obj(obj_path)
     print(f"  {raw.face_count} faces, {len(raw.positions)} vertices")
 
-    print(f"Running pipeline (n_pieces={n_pieces}) ...")
-    result = run_pipeline(raw, n_pieces=n_pieces)
+    print(f"Running pipeline (n_pieces={n_pieces}, force_exact_count={force_exact_count}) ...")
+    result = run_pipeline(raw, n_pieces=n_pieces, force_exact_count=force_exact_count)
     elapsed = time.perf_counter() - t0
 
     working, tri, relaxed = result.working, result.triage, result.relaxed

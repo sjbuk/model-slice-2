@@ -14,7 +14,8 @@ major component -- either changes how much area is actually "behind" each
 major. Re-running apportionment against Stage 2's real majors/anchors (using
 Stage 1's own _apportion helper) keeps the total seed count equal to the
 originally requested N while giving a promoted component its fair share
-instead of zero.
+instead of zero -- or raises, mirroring Stage 1's own guard, if promotion
+left more majors than N to go around (see _reapportion).
 
 Seeds are placed within a major component's own induced subgraph only --
 walking through a bridge edge into a satellite (or another major) would place
@@ -48,6 +49,12 @@ def _reapportion(triage: TriageResult, bridges: BridgeResult) -> dict[int, int]:
 
     weights = {c: triage.component_areas[c] + adopted_area[c] for c in bridges.major_ids}
     n_pieces = sum(triage.piece_counts.values())
+    if n_pieces < len(bridges.major_ids):
+        raise ValueError(
+            f"N={n_pieces} is too low: {len(bridges.major_ids)} components require their own "
+            f"piece after bridging ({len(bridges.promoted_ids)} satellite(s) found no valid "
+            "bridge and were promoted to major), so at least that many pieces are required."
+        )
     return _apportion(sorted(bridges.major_ids), weights, n_pieces)
 
 
