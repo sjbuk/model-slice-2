@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>JigSaw2 OBJ Viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1b1d22; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
+  #panel {
+    position: absolute; top: 0; left: 0; z-index: 10;
+    padding: 10px 14px; background: rgba(20,20,24,0.85);
+    border-bottom-right-radius: 8px; display: flex; align-items: center; gap: 14px;
+    flex-wrap: wrap; max-width: calc(100% - 28px);
+  }
+  #panel label { font-size: 13px; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  #panel button {
+    background: #33363f; color: #eee; border: 1px solid #4a4d57; border-radius: 5px;
+    padding: 5px 10px; font-size: 13px; cursor: pointer;
+  }
+  #panel button:hover { background: #43464f; }
+  #hint { font-size: 12px; color: #9aa0aa; }
+  #status { position: absolute; bottom: 8px; left: 10px; font-size: 12px; color: #9aa0aa; z-index: 10; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <label>Load .obj (+ optional .mtl):
+    <input type="file" id="fileInput" accept=".obj,.mtl" multiple>
+  </label>
+  <button id="clearBtn">Clear</button>
+  <button id="resetViewBtn">Reset view</button>
+  <label><input type="checkbox" id="wireframeChk"> Wireframe</label>
+  <label><input type="checkbox" id="uvChk"> UV checker</label>
+  <label><input type="checkbox" id="bgChk"> Light background</label>
+  <span id="hint">Tip: select all piece_*.obj files at once to see the whole reassembled model, auto-colored per file.</span>
+</div>
+<div id="status">No files loaded.</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/OBJLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/MTLLoader.js"></script>
+<script>
+const DARK_BG = 0x1b1d22;
+const LIGHT_BG = 0xe8e9ec;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(DARK_BG);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.001, 10000);
+camera.position.set(1, 1, 1);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+const ambient = new THREE.AmbientLight(0xffffff, 0.55);
+scene.add(ambient);
+const keyLight = new THREE.DirectionalLight(0xffffff, 0.9);
+keyLight.position.set(3, 5, 4);
+scene.add(keyLight);
+const fillLight = new THREE.DirectionalLight(0xffffff, 0.35);
+fillLight.position.set(-4, -2, -3);
+scene.add(fillLight);
+
+const contentGroup = new THREE.Group();
+scene.add(contentGroup);
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+function baseName(name) {
+  return name.replace(/^.*[\\/]/, '').replace(/\.[^.]+$/, '');
+}
+
+function readText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsText(file);
+  });
+}
+
+function extractMtllibName(objText) {
+  const match = objText.match(/^mtllib\s+(.+)$/m);
+  return match ? match[1].trim() : null;
+}
+
+function hsvColor(h) {
+  const c = new THREE.Color();
+  c.setHSL(((h % 1) + 1) % 1, 0.65, 0.55);
+  return c;
+}
+
+// Golden-angle increment so a color derived from a piece's index stays the
+// same regardless of how many files happen to be loaded alongside it --
+// unlike `index / totalCount`, which collapses to the same hue whenever
+// only one file is loaded (the bug: every piece viewed alone came out
+// identical teal).
+const GOLDEN_RATIO_CONJUGATE = 0.6180339887498949;
+let autoColorCounter = 0;
+
+function colorForFile(fileName) {
+  const match = fileName.match(/(\d+)(?=\.[^.]*$)/);
+  const idx = match ? parseInt(match[0], 10) : autoColorCounter++;
+  return hsvColor(idx * GOLDEN_RATIO_CONJUGATE);
+}
+
+// A baked checkerboard "UV test grid" -- the standard way to visually verify
+// UV layout, since the per-piece materials here are flat colors that encode
+// which region a face belongs to, not its UVs.
+let uvCheckerTexture = null;
+function getUvCheckerTexture() {
+  if (uvCheckerTexture) return uvCheckerTexture;
+  const size = 512;
+  const cells = 16;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  const cellSize = size / cells;
+  for (let y = 0; y < cells; y++) {
+    for (let x = 0; x < cells; x++) {
+      ctx.fillStyle = (x + y) % 2 === 0 ? '#d8dbe2' : '#3a6fd8';
+      ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+    }
+  }
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(0, 0, size, size);
+  uvCheckerTexture = new THREE.CanvasTexture(canvas);
+  uvCheckerTexture.wrapS = THREE.RepeatWrapping;
+  uvCheckerTexture.wrapT = THREE.RepeatWrapping;
+  return uvCheckerTexture;
+}
+
+function applyUvChecker(on) {
+  contentGroup.traverse(c => {
+    if (!c.isMesh) return;
+    if (!c.userData.baseMaterial) c.userData.baseMaterial = c.material;
+    if (on) {
+      if (!c.userData.checkerMaterial) {
+        c.userData.checkerMaterial = new THREE.MeshStandardMaterial({
+          map: getUvCheckerTexture(), side: THREE.DoubleSide, roughness: 0.8,
+        });
+      }
+      c.material = c.userData.checkerMaterial;
+    } else {
+      c.material = c.userData.baseMaterial;
+    }
+  });
+  applyWireframe();
+}
+
+function applyWireframe() {
+  const on = document.getElementById('wireframeChk').checked;
+  contentGroup.traverse(c => {
+    if (c.isMesh) {
+      const mats = Array.isArray(c.material) ? c.material : [c.material];
+      mats.forEach(m => { if (m) m.wireframe = on; });
+    }
+  });
+}
+
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg;
+}
+
+function clearScene() {
+  for (let i = contentGroup.children.length - 1; i >= 0; i--) {
+    const obj = contentGroup.children[i];
+    obj.traverse(c => {
+      if (c.isMesh) {
+        c.geometry.dispose();
+        if (Array.isArray(c.material)) c.material.forEach(m => m.dispose());
+        else if (c.material) c.material.dispose();
+      }
+    });
+    contentGroup.remove(obj);
+  }
+  setStatus('No files loaded.');
+}
+
+function frameCameraOnScene() {
+  const box = new THREE.Box3().setFromObject(contentGroup);
+  if (box.isEmpty()) return;
+  const size = new THREE.Vector3();
+  const center = new THREE.Vector3();
+  box.getSize(size);
+  box.getCenter(center);
+
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  const fitDist = (maxDim / 2) / Math.tan((camera.fov * Math.PI / 180) / 2) * 1.6;
+
+  controls.target.copy(center);
+  camera.near = maxDim / 1000;
+  camera.far = maxDim * 100;
+  camera.updateProjectionMatrix();
+  camera.position.copy(center).add(new THREE.Vector3(fitDist, fitDist * 0.6, fitDist));
+  controls.update();
+}
+
+async function handleFiles(fileList) {
+  const files = Array.from(fileList);
+  if (files.length === 0) return;
+
+  const mtlFiles = files.filter(f => f.name.toLowerCase().endsWith('.mtl'));
+  const objFiles = files.filter(f => f.name.toLowerCase().endsWith('.obj'));
+
+  const mtlTextByBase = {};
+  for (const f of mtlFiles) {
+    mtlTextByBase[baseName(f.name)] = await readText(f);
+  }
+
+  let loaded = 0;
+
+  for (const f of objFiles) {
+    let objText;
+    try {
+      objText = await readText(f);
+    } catch (err) {
+      console.error('Failed to read', f.name, err);
+      continue;
+    }
+
+    const mtlName = extractMtllibName(objText);
+    const mtlText = mtlName ? mtlTextByBase[baseName(mtlName)] : undefined;
+
+    let group;
+    try {
+      const objLoader = new THREE.OBJLoader();
+      if (mtlText) {
+        const mtlLoader = new THREE.MTLLoader();
+        const materials = mtlLoader.parse(mtlText, '');
+        materials.preload();
+        objLoader.setMaterials(materials);
+        group = objLoader.parse(objText);
+        group.traverse(c => { if (c.isMesh) c.material.side = THREE.DoubleSide; });
+      } else {
+        group = objLoader.parse(objText);
+        const color = colorForFile(f.name);
+        group.traverse(c => {
+          if (c.isMesh) {
+            c.material = new THREE.MeshStandardMaterial({ color, side: THREE.DoubleSide, roughness: 0.7 });
+          }
+        });
+      }
+    } catch (err) {
+      console.error('Failed to parse', f.name, err);
+      continue;
+    }
+
+    contentGroup.add(group);
+    loaded++;
+  }
+
+  setStatus(`${loaded} file(s) loaded.`);
+  frameCameraOnScene();
+  applyUvChecker(document.getElementById('uvChk').checked);
+}
+
+document.getElementById('fileInput').addEventListener('change', (e) => handleFiles(e.target.files));
+document.getElementById('clearBtn').addEventListener('click', clearScene);
+document.getElementById('resetViewBtn').addEventListener('click', frameCameraOnScene);
+
+document.getElementById('wireframeChk').addEventListener('change', applyWireframe);
+document.getElementById('uvChk').addEventListener('change', (e) => applyUvChecker(e.target.checked));
+
+document.getElementById('bgChk').addEventListener('change', (e) => {
+  scene.background = new THREE.Color(e.target.checked ? LIGHT_BG : DARK_BG);
+});
+
+// Drag-and-drop support.
+window.addEventListener('dragover', (e) => e.preventDefault());
+window.addEventListener('drop', (e) => {
+  e.preventDefault();
+  if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files);
+});
+</script>
+</body>
+</html>

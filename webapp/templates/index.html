@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>JigSaw2 -- Mesh Slicer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1b1d22; color: #eee; font-family: system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+
+  header {
+    padding: 12px 18px; background: #22242b; border-bottom: 1px solid #33363f;
+    display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+
+  form#sliceForm { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  form#sliceForm label { font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  input[type=file] { color: #eee; font-size: 13px; }
+  input[type=number] { width: 60px; background: #33363f; color: #eee; border: 1px solid #4a4d57; border-radius: 4px; padding: 4px 6px; }
+  button {
+    background: #4a6ef2; color: #fff; border: none; border-radius: 5px;
+    padding: 7px 14px; font-size: 13px; cursor: pointer; font-weight: 600;
+  }
+  button:hover { background: #5c7cf5; }
+  button:disabled { background: #555; cursor: default; }
+
+  #main { flex: 1; display: flex; min-height: 0; }
+  #viewport { flex: 1; position: relative; }
+  canvas { display: block; }
+
+  #sidebar {
+    width: 320px; flex-shrink: 0; overflow-y: auto; background: #22242b;
+    border-left: 1px solid #33363f; padding: 14px; font-size: 13px;
+  }
+  #sidebar h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: #9aa0aa; margin: 18px 0 8px; }
+  #sidebar h2:first-child { margin-top: 0; }
+  #statusMsg { font-size: 13px; color: #9aa0aa; white-space: pre-wrap; }
+  #statusMsg.error { color: #f28b82; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 3px 4px; border-bottom: 1px solid #33363f; }
+  th { color: #9aa0aa; font-weight: 500; }
+
+  .viewToggle { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .viewToggle button { background: #33363f; padding: 4px 9px; font-size: 12px; font-weight: 400; }
+  .viewToggle button.active { background: #4a6ef2; }
+
+  #controlsPanel {
+    position: absolute; top: 10px; left: 10px; z-index: 5;
+    background: rgba(20,20,24,0.8); padding: 8px 12px; border-radius: 6px;
+    font-size: 12px; display: flex; gap: 12px; align-items: center;
+  }
+  #controlsPanel label { display: flex; align-items: center; gap: 4px; }
+
+  a.dl { color: #8ab4f8; text-decoration: none; }
+  a.dl:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>JigSaw2 &mdash; Mesh Slicer</h1>
+  <form id="sliceForm">
+    <label>Model: <input type="file" id="modelFile" accept=".fbx,.glb,.obj" required></label>
+    <label>Pieces: <input type="number" id="nPieces" value="8" min="2" max="200"></label>
+    <button type="submit" id="sliceBtn">Slice</button>
+  </form>
+</header>
+
+<div id="main">
+  <div id="viewport">
+    <div id="controlsPanel">
+      <label><input type="checkbox" id="wireframeChk"> Wireframe</label>
+      <label><input type="checkbox" id="uvChk"> UV checker</label>
+      <label><input type="checkbox" id="bgChk"> Light background</label>
+      <button type="button" id="resetViewBtn">Reset view</button>
+    </div>
+  </div>
+  <div id="sidebar">
+    <h2>Status</h2>
+    <div id="statusMsg">Upload an FBX or OBJ model and click Slice.</div>
+
+    <div id="resultsBlock" style="display:none">
+      <h2>Result</h2>
+      <div id="summary"></div>
+
+      <h2>View</h2>
+      <div class="viewToggle" id="viewToggle"></div>
+
+      <h2>Pieces</h2>
+      <table>
+        <thead><tr><th>#</th><th>Faces</th><th>Area dev.</th><th></th></tr></thead>
+        <tbody id="piecesTable"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/OBJLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/MTLLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/libs/fflate.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/FBXLoader.js"></script>
+<script>
+// ---------------------------------------------------------------------
+// Three.js viewer -- same scene/camera/lighting setup as tools/obj_viewer.html,
+// but loading server-hosted files via fetch() instead of a local <input type=file>
+// picker, since results now live behind an HTTP route rather than on disk.
+// ---------------------------------------------------------------------
+const DARK_BG = 0x1b1d22;
+const LIGHT_BG = 0xe8e9ec;
+
+const viewport = document.getElementById('viewport');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(DARK_BG);
+
+const camera = new THREE.PerspectiveCamera(50, viewport.clientWidth / viewport.clientHeight, 0.001, 10000);
+camera.position.set(1, 1, 1);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(viewport.clientWidth, viewport.clientHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+viewport.appendChild(renderer.domElement);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const keyLight = new THREE.DirectionalLight(0xffffff, 0.9);
+keyLight.position.set(3, 5, 4);
+scene.add(keyLight);
+const fillLight = new THREE.DirectionalLight(0xffffff, 0.35);
+fillLight.position.set(-4, -2, -3);
+scene.add(fillLight);
+
+const contentGroup = new THREE.Group();
+scene.add(contentGroup);
+
+new ResizeObserver(() => {
+  camera.aspect = viewport.clientWidth / viewport.clientHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(viewport.clientWidth, viewport.clientHeight);
+}).observe(viewport);
+
+(function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+})();
+
+const GOLDEN_RATIO_CONJUGATE = 0.6180339887498949;
+
+function hsvColor(h) {
+  const c = new THREE.Color();
+  c.setHSL(((h % 1) + 1) % 1, 0.65, 0.55);
+  return c;
+}
+
+// A baked checkerboard "UV test grid" -- the standard way to visually verify
+// UV layout, applied on top of whichever material a mesh already has
+// (flat per-piece colors, the real source texture, or nothing at all).
+let uvCheckerTexture = null;
+function getUvCheckerTexture() {
+  if (uvCheckerTexture) return uvCheckerTexture;
+  const size = 512;
+  const cells = 16;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  const cellSize = size / cells;
+  for (let y = 0; y < cells; y++) {
+    for (let x = 0; x < cells; x++) {
+      ctx.fillStyle = (x + y) % 2 === 0 ? '#d8dbe2' : '#3a6fd8';
+      ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+    }
+  }
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(0, 0, size, size);
+  uvCheckerTexture = new THREE.CanvasTexture(canvas);
+  uvCheckerTexture.wrapS = THREE.RepeatWrapping;
+  uvCheckerTexture.wrapT = THREE.RepeatWrapping;
+  return uvCheckerTexture;
+}
+
+function applyUvChecker(on) {
+  contentGroup.traverse(c => {
+    if (!c.isMesh) return;
+    if (!c.userData.baseMaterial) c.userData.baseMaterial = c.material;
+    if (on) {
+      if (!c.userData.checkerMaterial) {
+        c.userData.checkerMaterial = new THREE.MeshStandardMaterial({
+          map: getUvCheckerTexture(), side: THREE.DoubleSide, roughness: 0.8,
+        });
+      }
+      c.material = c.userData.checkerMaterial;
+    } else {
+      c.material = c.userData.baseMaterial;
+    }
+  });
+  applyWireframe();
+}
+
+function clearScene() {
+  for (let i = contentGroup.children.length - 1; i >= 0; i--) {
+    const obj = contentGroup.children[i];
+    obj.traverse(c => {
+      if (c.isMesh) {
+        c.geometry.dispose();
+        if (Array.isArray(c.material)) c.material.forEach(m => m.dispose());
+        else if (c.material) c.material.dispose();
+      }
+    });
+    contentGroup.remove(obj);
+  }
+}
+
+function frameCameraOnScene() {
+  const box = new THREE.Box3().setFromObject(contentGroup);
+  if (box.isEmpty()) return;
+  const size = new THREE.Vector3();
+  const center = new THREE.Vector3();
+  box.getSize(size);
+  box.getCenter(center);
+
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  const fitDist = (maxDim / 2) / Math.tan((camera.fov * Math.PI / 180) / 2) * 1.6;
+
+  controls.target.copy(center);
+  camera.near = maxDim / 1000;
+  camera.far = maxDim * 100;
+  camera.updateProjectionMatrix();
+  camera.position.copy(center).add(new THREE.Vector3(fitDist, fitDist * 0.6, fitDist));
+  controls.update();
+}
+
+async function loadPreview(objUrl, mtlUrl) {
+  clearScene();
+  const [objText, mtlText] = await Promise.all([
+    fetch(objUrl).then(r => r.text()),
+    fetch(mtlUrl).then(r => r.text()),
+  ]);
+  const basePath = mtlUrl.slice(0, mtlUrl.lastIndexOf('/') + 1);
+  const mtlLoader = new THREE.MTLLoader();
+  const materials = mtlLoader.parse(mtlText, basePath);
+  materials.preload();
+  const objLoader = new THREE.OBJLoader();
+  objLoader.setMaterials(materials);
+  const group = objLoader.parse(objText);
+  group.traverse(c => { if (c.isMesh) c.material.side = THREE.DoubleSide; });
+  contentGroup.add(group);
+  frameCameraOnScene();
+  applyUvChecker(document.getElementById('uvChk').checked);
+}
+
+// The original, untouched upload (see app.py's original.* file) -- loaded
+// with a format-native loader rather than through the assimp-converted
+// pipeline.obj/mtl. That conversion is fine for geometry (which is all the
+// slicer needs) but assimp's OBJ exporter references embedded GLB/FBX
+// textures with its own internal `*N` index syntax instead of real image
+// files, which MTLLoader can't resolve -- the material silently falls back
+// to flat white. GLTFLoader/FBXLoader read those embedded textures directly,
+// so this is the only path that actually shows the model's real texture.
+function loadWithCallbackLoader(loader, url) {
+  return new Promise((resolve, reject) => loader.load(url, resolve, undefined, reject));
+}
+
+async function loadSourcePreview(url, type) {
+  clearScene();
+  let group;
+  if (type === 'glb') {
+    const gltf = await loadWithCallbackLoader(new THREE.GLTFLoader(), url);
+    group = gltf.scene;
+  } else if (type === 'fbx') {
+    group = await loadWithCallbackLoader(new THREE.FBXLoader(), url);
+  } else {
+    const objText = await fetch(url).then(r => r.text());
+    group = new THREE.OBJLoader().parse(objText);
+  }
+
+  group.traverse(c => {
+    if (!c.isMesh) return;
+    if (!c.material) c.material = new THREE.MeshStandardMaterial({ color: 0x9099a6, roughness: 0.8 });
+    const mats = Array.isArray(c.material) ? c.material : [c.material];
+    mats.forEach(m => { m.side = THREE.DoubleSide; });
+  });
+  contentGroup.add(group);
+  frameCameraOnScene();
+  applyUvChecker(document.getElementById('uvChk').checked);
+}
+
+async function loadAllPiecesSeparately(pieceUrls) {
+  clearScene();
+  const texts = await Promise.all(pieceUrls.map(u => fetch(u).then(r => r.text())));
+  texts.forEach((text, idx) => {
+    const group = new THREE.OBJLoader().parse(text);
+    const color = hsvColor(idx * GOLDEN_RATIO_CONJUGATE);
+    group.traverse(c => {
+      if (c.isMesh) c.material = new THREE.MeshStandardMaterial({ color, side: THREE.DoubleSide, roughness: 0.7 });
+    });
+    contentGroup.add(group);
+  });
+  frameCameraOnScene();
+  applyUvChecker(document.getElementById('uvChk').checked);
+}
+
+async function loadSinglePiece(pieceUrl, idx) {
+  clearScene();
+  const text = await fetch(pieceUrl).then(r => r.text());
+  const group = new THREE.OBJLoader().parse(text);
+  const color = hsvColor(idx * GOLDEN_RATIO_CONJUGATE);
+  group.traverse(c => {
+    if (c.isMesh) c.material = new THREE.MeshStandardMaterial({ color, side: THREE.DoubleSide, roughness: 0.7 });
+  });
+  contentGroup.add(group);
+  frameCameraOnScene();
+  applyUvChecker(document.getElementById('uvChk').checked);
+}
+
+function applyWireframe() {
+  const on = document.getElementById('wireframeChk').checked;
+  contentGroup.traverse(c => {
+    if (c.isMesh) {
+      const mats = Array.isArray(c.material) ? c.material : [c.material];
+      mats.forEach(m => { if (m) m.wireframe = on; });
+    }
+  });
+}
+
+document.getElementById('wireframeChk').addEventListener('change', applyWireframe);
+document.getElementById('uvChk').addEventListener('change', (e) => applyUvChecker(e.target.checked));
+document.getElementById('bgChk').addEventListener('change', (e) => {
+  scene.background = new THREE.Color(e.target.checked ? LIGHT_BG : DARK_BG);
+});
+document.getElementById('resetViewBtn').addEventListener('click', frameCameraOnScene);
+
+// ---------------------------------------------------------------------
+// Upload / slice / results UI.
+// ---------------------------------------------------------------------
+const form = document.getElementById('sliceForm');
+const statusMsg = document.getElementById('statusMsg');
+const sliceBtn = document.getElementById('sliceBtn');
+const resultsBlock = document.getElementById('resultsBlock');
+const summary = document.getElementById('summary');
+const viewToggle = document.getElementById('viewToggle');
+const piecesTable = document.getElementById('piecesTable');
+
+let lastResult = null;
+
+function setStatus(msg, isError) {
+  statusMsg.textContent = msg;
+  statusMsg.className = isError ? 'error' : '';
+}
+
+function setActiveToggle(button) {
+  viewToggle.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+  if (button) button.classList.add('active');
+}
+
+let pollTimer = null;
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fileInput = document.getElementById('modelFile');
+  const nPieces = document.getElementById('nPieces').value;
+  if (!fileInput.files.length) return;
+
+  stopPolling();
+  sliceBtn.disabled = true;
+  resultsBlock.style.display = 'none';
+  setStatus(`Uploading ${fileInput.files[0].name}...`);
+
+  const fd = new FormData();
+  fd.append('model', fileInput.files[0]);
+  fd.append('n_pieces', nPieces);
+
+  try {
+    const resp = await fetch('/api/slice', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (!resp.ok) {
+      setStatus(data.error || `Request failed (${resp.status}).`, true);
+      sliceBtn.disabled = false;
+      return;
+    }
+    setStatus('Slicing queued...');
+    pollJob(data.job_id);
+  } catch (err) {
+    setStatus(`Request failed: ${err}`, true);
+    sliceBtn.disabled = false;
+  }
+});
+
+function pollJob(jobId) {
+  pollTimer = setInterval(async () => {
+    let data;
+    try {
+      const resp = await fetch(`/api/jobs/${jobId}`);
+      data = await resp.json();
+      if (!resp.ok) {
+        stopPolling();
+        setStatus(data.error || `Request failed (${resp.status}).`, true);
+        sliceBtn.disabled = false;
+        return;
+      }
+    } catch (err) {
+      stopPolling();
+      setStatus(`Request failed: ${err}`, true);
+      sliceBtn.disabled = false;
+      return;
+    }
+
+    if (data.status === 'running') {
+      setStatus(`Slicing... ${data.elapsed_seconds}s elapsed. Multi-pass relaxation on real-world meshes can take a while (see the Stage 8 note in the project README) -- this will time out on its own after a few minutes if it's stuck.`);
+      return;
+    }
+
+    stopPolling();
+    sliceBtn.disabled = false;
+
+    if (data.status === 'error') {
+      setStatus(data.error, true);
+      return;
+    }
+
+    lastResult = data;
+    renderResult(data);
+    setStatus(`Done in ${data.elapsed_seconds}s.`);
+  }, 1500);
+}
+
+function renderResult(data) {
+  resultsBlock.style.display = 'block';
+
+  summary.innerHTML = `
+    <table>
+      <tr><td>Source faces</td><td>${data.source_faces}</td></tr>
+      <tr><td>Pieces</td><td>${data.piece_count}</td></tr>
+      <tr><td>Converged</td><td>${data.converged ? 'yes' : 'no'}</td></tr>
+      <tr><td>Max area deviation</td><td>${(data.max_area_deviation * 100).toFixed(1)}%</td></tr>
+      <tr><td>Iterations</td><td>${data.iterations_run}</td></tr>
+    </table>
+  `;
+
+  viewToggle.innerHTML = '';
+  const combinedBtn = document.createElement('button');
+  combinedBtn.type = 'button';
+  combinedBtn.textContent = 'Combined (colored)';
+  combinedBtn.addEventListener('click', () => {
+    setActiveToggle(combinedBtn);
+    loadPreview(data.preview_obj, data.preview_mtl);
+  });
+  viewToggle.appendChild(combinedBtn);
+
+  const sourceBtn = document.createElement('button');
+  sourceBtn.type = 'button';
+  sourceBtn.textContent = 'Original texture';
+  sourceBtn.addEventListener('click', () => {
+    setActiveToggle(sourceBtn);
+    loadSourcePreview(data.source_url, data.source_type);
+  });
+  viewToggle.appendChild(sourceBtn);
+
+  const allBtn = document.createElement('button');
+  allBtn.type = 'button';
+  allBtn.textContent = 'All pieces (separate)';
+  allBtn.addEventListener('click', () => {
+    setActiveToggle(allBtn);
+    loadAllPiecesSeparately(data.piece_urls);
+  });
+  viewToggle.appendChild(allBtn);
+
+  piecesTable.innerHTML = '';
+  data.pieces.forEach((p) => {
+    const tr = document.createElement('tr');
+    const devPct = (p.deviation * 100).toFixed(1);
+    tr.innerHTML = `
+      <td><a href="#" class="dl" data-idx="${p.index}">${p.index}</a></td>
+      <td>${p.faces}</td>
+      <td>${devPct > 0 ? '+' : ''}${devPct}%</td>
+      <td><a class="dl" href="${data.piece_urls[p.index]}" download>download</a></td>
+    `;
+    tr.querySelector('a[data-idx]').addEventListener('click', (e) => {
+      e.preventDefault();
+      setActiveToggle(null);
+      loadSinglePiece(data.piece_urls[p.index], p.index);
+    });
+    piecesTable.appendChild(tr);
+  });
+
+  setActiveToggle(combinedBtn);
+  loadPreview(data.preview_obj, data.preview_mtl);
+}
+</script>
+</body>
+</html>
