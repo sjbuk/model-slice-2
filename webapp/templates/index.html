@@ -37,6 +37,19 @@
   #statusMsg { font-size: 13px; color: #9aa0aa; white-space: pre-wrap; }
   #statusMsg.error { color: #f28b82; }
 
+  #phaseList { display: none; margin-top: 10px; font-size: 12px; }
+  .phase-item { display: flex; align-items: center; gap: 6px; padding: 2px 0; color: #63666f; }
+  .phase-item .mark { width: 14px; flex-shrink: 0; text-align: center; }
+  .phase-item.done { color: #9aa0aa; }
+  .phase-item.done .mark { color: #6fcf7c; }
+  .phase-item.active { color: #eee; font-weight: 600; }
+  .phase-item.active .mark { color: #4a6ef2; }
+
+  #substepBar { display: none; margin-top: 10px; }
+  #substepBarLabel { font-size: 12px; color: #9aa0aa; margin-bottom: 4px; }
+  #substepBarTrack { background: #33363f; border-radius: 4px; height: 6px; overflow: hidden; }
+  #substepBarFill { background: #4a6ef2; height: 100%; width: 0%; transition: width 0.2s ease; }
+
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th, td { text-align: left; padding: 3px 4px; border-bottom: 1px solid #33363f; }
   th { color: #9aa0aa; font-weight: 500; }
@@ -98,6 +111,11 @@
   <div id="sidebar">
     <h2>Status</h2>
     <div id="statusMsg">Upload an FBX or OBJ model and click Slice.</div>
+    <div id="phaseList"></div>
+    <div id="substepBar">
+      <div id="substepBarLabel"></div>
+      <div id="substepBarTrack"><div id="substepBarFill"></div></div>
+    </div>
 
     <div id="resultsBlock" style="display:none">
       <h2>Result</h2>
@@ -884,6 +902,10 @@ document.getElementById('resetViewBtn').addEventListener('click', () => frameCam
 const form = document.getElementById('sliceForm');
 const statusMsg = document.getElementById('statusMsg');
 const sliceBtn = document.getElementById('sliceBtn');
+const phaseList = document.getElementById('phaseList');
+const substepBar = document.getElementById('substepBar');
+const substepBarLabel = document.getElementById('substepBarLabel');
+const substepBarFill = document.getElementById('substepBarFill');
 const resultsBlock = document.getElementById('resultsBlock');
 const summary = document.getElementById('summary');
 const layoutToggle = document.getElementById('layoutToggle');
@@ -896,6 +918,40 @@ let activeLayoutKey = null;
 function setStatus(msg, isError) {
   statusMsg.textContent = msg;
   statusMsg.className = isError ? 'error' : '';
+}
+
+function hideProgress() {
+  phaseList.style.display = 'none';
+  phaseList.innerHTML = '';
+  substepBar.style.display = 'none';
+}
+
+function renderProgress(data) {
+  const phases = data.all_phases;
+  if (!phases || !phases.length) {
+    hideProgress();
+    return;
+  }
+
+  const completed = new Set(data.completed_phases || []);
+  phaseList.innerHTML = phases.map(name => {
+    const isDone = completed.has(name);
+    const isActive = name === data.current_phase;
+    const cls = isActive ? 'active' : (isDone ? 'done' : '');
+    const mark = isDone ? '✓' : (isActive ? '●' : '○');
+    return `<div class="phase-item ${cls}"><span class="mark">${mark}</span>${name}</div>`;
+  }).join('');
+  phaseList.style.display = 'block';
+
+  if (data.substep_current != null && data.substep_total) {
+    const pct = Math.min(100, Math.round((data.substep_current / data.substep_total) * 100));
+    const label = data.substep_label || data.current_phase || '';
+    substepBarLabel.textContent = `${label}: ${data.substep_current} / ${data.substep_total}`;
+    substepBarFill.style.width = `${pct}%`;
+    substepBar.style.display = 'block';
+  } else {
+    substepBar.style.display = 'none';
+  }
 }
 
 // Layout (Combined / Original model / All pieces / Test construction) and
@@ -968,6 +1024,7 @@ form.addEventListener('submit', async (e) => {
   stopPolling();
   sliceBtn.disabled = true;
   resultsBlock.style.display = 'none';
+  hideProgress();
   setUiForMode(null);
   setStatus(`Uploading ${fileInput.files[0].name}...`);
 
@@ -1013,6 +1070,7 @@ function pollJob(jobId) {
 
     if (data.status === 'running') {
       setStatus(`Slicing... ${data.elapsed_seconds}s elapsed. Multi-pass relaxation on real-world meshes can take a while (see the Stage 8 note in the project README) -- this will be stopped automatically after 2 hours if it's stuck.`);
+      renderProgress(data);
       return;
     }
 

@@ -11,6 +11,7 @@ from meshpartition.stage4 import build_dual_graph
 from meshpartition.stage5 import seed
 from meshpartition.stage6 import grow
 from meshpartition.stage7 import repair
+from meshpartition.progress import ProgressReporter
 from meshpartition.stage8 import DEFAULT_EPSILON_BAL, _EXACT_MEDOID_MAX_FACES, _medoid, relax
 
 from fixtures import fixture_a_sphere, fixture_e_ribbon
@@ -58,6 +59,37 @@ def test_8_2_best_retained():
     assert len(relaxed.scores) == relaxed.iterations_run == 3
     assert relaxed.score == min(relaxed.scores)
     assert relaxed.score != relaxed.scores[-1]  # final iteration was worse than the best
+
+
+def test_relax_substep_progress_climbs_monotonically_across_iterations():
+    """The medoid substep counter reported to `progress` must climb across
+    the whole relax call, not reset to 1 at the start of every Lloyd
+    iteration -- a per-iteration-only counter looks identical whether it's
+    iteration 1 or iteration 14 of i_max, giving no sense of overall
+    progress through the phase.
+    """
+    working, graph, result, bridges, seed_result, growth, repaired = _run_to_repair(
+        fixture_a_sphere, n_pieces=18
+    )
+
+    snapshots = []
+    reporter = ProgressReporter(on_update=snapshots.append, min_interval=0.0)
+    relaxed = relax(
+        working, graph, result, bridges, seed_result, growth, repaired, i_max=3, progress=reporter
+    )
+    assert relaxed.iterations_run == 3  # confirms >1 Lloyd pass actually ran
+
+    substep_values = [
+        s["substep_current"] for s in snapshots if s.get("substep_total") is not None
+    ]
+    assert len(substep_values) > 1
+    # Non-decreasing across the whole phase (never drops back to a small
+    # value partway through, the way a per-iteration-only counter would at
+    # the start of iteration 2).
+    assert substep_values == sorted(substep_values)
+    # Actually increases somewhere (not just flat) -- two Lloyd passes over
+    # 18 regions each should produce real forward movement.
+    assert substep_values[-1] > substep_values[0]
 
 
 def test_8_4_large_region_medoid_stays_bounded():

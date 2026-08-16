@@ -114,6 +114,7 @@ def slice_model():
             str(n_pieces),
             str(job_dir),
             "1" if force_exact_count else "0",
+            file.filename,
         ]
     )
     with JOBS_LOCK:
@@ -150,7 +151,15 @@ def job_status(job_id):
                 "error": f"Slicing timed out after {JOB_TIME_BUDGET_SECONDS}s and was stopped.",
             }
             return jsonify(job["response"])
-        return jsonify(status="running", elapsed_seconds=round(elapsed, 1))
+
+        progress_path = job["job_dir"] / "progress.json"
+        progress_fields = {}
+        if progress_path.exists():
+            try:
+                progress_fields = json.loads(progress_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass  # worker is mid-write or the file just disappeared; skip this poll's progress
+        return jsonify(status="running", elapsed_seconds=round(elapsed, 1), **progress_fields)
 
     result_path = job["job_dir"] / "result.json"
     if proc.returncode != 0 or not result_path.exists():

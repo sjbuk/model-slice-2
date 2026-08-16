@@ -39,6 +39,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from .mesh import WorkingMesh
+from .progress import ProgressReporter
 from .stage1 import TriageResult
 from .util import (
     bbox_diagonal,
@@ -181,6 +182,7 @@ def build_bridges(
     theta_n: float = DEFAULT_THETA_N,
     enclosure_threshold: float = DEFAULT_ENCLOSURE_THRESHOLD,
     force_exact_count: bool = False,
+    progress: ProgressReporter | None = None,
 ) -> BridgeResult:
     """force_exact_count=True disables promotion: a satellite that fails the
     gap/normal-agreement test force-adopts Stage 1's provisional
@@ -228,7 +230,11 @@ def build_bridges(
     promoted_ids: list[int] = []
     winding_numbers: dict[tuple[int, int], float] = {}
 
-    for satellite in triage.satellite_ids:
+    n_satellites = len(triage.satellite_ids)
+    for i, satellite in enumerate(triage.satellite_ids):
+        if progress is not None:
+            progress.substep(i + 1, n_satellites, label="satellites")
+
         satellite_faces = np.nonzero(face_component_id == satellite)[0]
 
         tau_s = _satellite_gap_threshold(

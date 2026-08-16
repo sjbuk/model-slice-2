@@ -63,6 +63,20 @@ def main() -> None:
               f"faces={int((relaxed.label == i).sum())}")
     print(f"Elapsed: {elapsed:.2f}s")
 
+    print()
+    print("=== Model stats ===")
+    print(f"  source: {obj_path} ({Path(obj_path).stat().st_size} bytes)")
+    print(f"  raw: {raw.face_count} faces, {len(raw.positions)} vertices")
+    print(f"  welded: {working.vertex_count} vertices, {working.face_count} faces "
+          f"({result.ingest_stats.degenerate_face_count} degenerate removed)")
+    print(f"  {len(tri.major_ids)} major component(s), {len(tri.satellite_ids)} satellite(s)")
+    print(f"  n_pieces requested: {n_pieces} (force_exact_count={force_exact_count})")
+
+    print()
+    print("=== Stage timings ===")
+    for entry in result.stage_timings:
+        print(f"  {entry['name']:<12} {entry['duration_seconds']:.3f}s")
+
     out_dir = Path("output") / Path(obj_path).stem
     out_dir.mkdir(parents=True, exist_ok=True)
 

@@ -39,6 +39,7 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
 from .mesh import WorkingMesh
+from .progress import ProgressReporter
 from .stage1 import TriageResult
 from .stage2 import BridgeResult
 from .stage4 import DualGraph
@@ -208,6 +209,7 @@ def relax(
     epsilon_bal: float = DEFAULT_EPSILON_BAL,
     i_max: int = DEFAULT_I_MAX,
     gamma: float = DEFAULT_GAMMA,
+    progress: ProgressReporter | None = None,
 ) -> RelaxationResult:
     abar = triage.abar
     bbox_diag = bbox_diagonal(working.positions)
@@ -218,11 +220,29 @@ def relax(
     current_alpha = repaired.next_alpha
     iterations_run = 1
 
+    # The while loop runs at most (i_max - 1) more passes (iterations_run
+    # starts at 1), each computing one medoid per region -- report substep
+    # progress as a single counter over all of those medoid computations
+    # combined, rather than restarting a 1..n_regions bar every pass. A
+    # per-pass-only bar looks identical on iteration 1 and iteration 14,
+    # giving no sense of overall relax progress; this counter instead climbs
+    # monotonically across the whole phase, with the label carrying which
+    # Lloyd iteration is currently in flight.
+    total_medoid_steps = (i_max - 1) * n_regions
+
     while records[-1].max_area_deviation > epsilon_bal and iterations_run < i_max:
-        medoid_faces = [
-            _medoid(_region_adjacency(dual_graph, records[-1].label, region_id))
-            for region_id in range(n_regions)
-        ]
+        pass_index = iterations_run - 1  # 0-based count of passes completed so far
+        iteration_label = f"relax iteration {iterations_run + 1}/{i_max}"
+        if progress is not None:
+            progress.substep(pass_index * n_regions, total_medoid_steps, label=iteration_label)
+
+        medoid_faces = []
+        for region_id in range(n_regions):
+            medoid_faces.append(_medoid(_region_adjacency(dual_graph, records[-1].label, region_id)))
+            if progress is not None:
+                progress.substep(
+                    pass_index * n_regions + region_id + 1, total_medoid_steps, label=iteration_label
+                )
         current_seed_result = _reseed(current_seed_result, medoid_faces)
 
         new_growth = grow(working, dual_graph, current_seed_result, abar=abar, alpha=current_alpha)
