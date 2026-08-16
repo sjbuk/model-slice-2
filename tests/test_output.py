@@ -123,13 +123,47 @@ def test_lowpoly_preview_decimates_and_colours_per_piece(tmp_path):
     mesh = trimesh.load(out_path, force="mesh")
     assert len(mesh.vertices) == n_vertices
     assert len(mesh.faces) == n_faces
-    assert n_faces <= 6 * max(4, round(120 / 6)) + 6 * 4  # per-piece budget, generous slack
+    assert n_faces <= 120 + 20  # single merged decimation, generous slack over the budget
     assert n_faces > 0
 
     colours = mesh.visual.vertex_colors
     # Each vertex belongs to exactly one (undecimated-per-piece) coloured
     # region -- confirm more than one distinct colour survived merging.
     assert len({tuple(c) for c in colours}) > 1
+
+
+def test_lowpoly_preview_does_not_tear_piece_seams(tmp_path):
+    """Pieces are cut from one continuous surface and share exact boundary
+    vertices before decimation. Decimating each piece independently used to
+    move those shared vertices apart on each side, opening visible gaps at
+    every piece boundary; merging+welding before decimating a single mesh
+    must not reintroduce that -- a heavily decimated sphere stays closed."""
+    result = run_pipeline(fixture_a_sphere(), n_pieces=5)
+    out_path = tmp_path / "lowpoly_preview.glb"
+
+    write_lowpoly_preview(out_path, result.pieces, target_faces=40)
+
+    mesh = trimesh.load(out_path, force="mesh")
+    assert mesh.is_watertight
+
+
+def test_lowpoly_preview_uses_original_uv_when_texture_given(tmp_path):
+    """When a texture image is supplied and every piece carries source UVs,
+    the preview is textured with it instead of flat per-piece colours."""
+    from PIL import Image
+
+    result = run_pipeline(fixture_c_shirt(), n_pieces=6)
+    texture = Image.new("RGB", (4, 4), (255, 0, 0))
+    for piece in result.pieces:
+        piece.uvs = np.zeros((len(piece.positions), 2), dtype=np.float64)
+        piece.faces_uv = piece.faces_pos.copy()
+
+    out_path = tmp_path / "lowpoly_preview.glb"
+    write_lowpoly_preview(out_path, result.pieces, target_faces=120, texture_image=texture)
+
+    mesh = trimesh.load(out_path, force="mesh")
+    assert isinstance(mesh.visual, trimesh.visual.TextureVisuals)
+    assert mesh.visual.uv is not None
 
 
 def test_adjacency_threshold_touching_vs_separated():

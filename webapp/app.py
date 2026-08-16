@@ -17,7 +17,9 @@ import uuid
 from pathlib import Path
 from threading import Lock
 
+import trimesh
 from flask import Flask, jsonify, render_template, request, send_from_directory
+from PIL import Image
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_ROOT = APP_ROOT / "output" / "web"
@@ -57,6 +59,44 @@ def convert_to_obj(source_path: Path, obj_path: Path) -> None:
     if result.returncode != 0 or not obj_path.exists():
         detail = result.stderr.strip() or result.stdout.strip() or "unknown assimp error"
         raise RuntimeError(f"{source_path.suffix.upper().lstrip('.')} conversion failed: {detail}")
+
+
+def extract_base_color_image(source_path: Path) -> Image.Image | None:
+    """Best-effort extraction of the source model's base-colour texture,
+    so lowpoly_preview.glb can be textured with the real material instead
+    of a flat per-piece colour swatch. GLB embeds its texture already;
+    FBX/OBJ go through the same assimp conversion `convert_to_obj` uses,
+    but exporting to GLB instead of OBJ, since GLB (unlike assimp's OBJ
+    export) embeds the texture image itself rather than an unresolvable
+    internal reference (see the comment on `pipeline_obj` above).
+    """
+    if source_path.suffix.lower() == ".glb":
+        glb_path = source_path
+    else:
+        glb_path = source_path.with_suffix(".texture_probe.glb")
+        try:
+            result = subprocess.run(
+                ["assimp", "export", str(source_path), str(glb_path)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode != 0 or not glb_path.exists():
+                return None
+        except Exception:
+            return None
+
+    try:
+        scene = trimesh.load(glb_path, force="scene", process=False)
+    except Exception:
+        return None
+
+    for geometry in scene.geometry.values():
+        material = getattr(geometry.visual, "material", None)
+        image = getattr(material, "baseColorTexture", None) or getattr(material, "image", None)
+        if image is not None:
+            return image
+    return None
 
 
 @app.route("/")
@@ -250,7 +290,11 @@ def save_job(job_id):
 
     piece_count = job["response"]["piece_count"]
     pieces = [load_obj(str(job_dir / f"piece_{i:02d}.obj")) for i in range(piece_count)]
-    lowpoly_vertices, lowpoly_faces = write_lowpoly_preview(job_dir / "lowpoly_preview.glb", pieces)
+    source_path = job_dir / job["source_name"]
+    texture_image = extract_base_color_image(source_path)
+    lowpoly_vertices, lowpoly_faces = write_lowpoly_preview(
+        job_dir / "lowpoly_preview.glb", pieces, texture_image=texture_image
+    )
 
     checkpoint_path = job_dir / "checkpoint.json"
     checkpoint = json.loads(checkpoint_path.read_text())

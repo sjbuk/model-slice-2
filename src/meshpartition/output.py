@@ -18,6 +18,7 @@ from pathlib import Path
 import numpy as np
 import trimesh
 from PIL import Image
+from scipy.spatial import cKDTree
 
 from .mesh import RawMesh, WorkingMesh
 from .stage10 import region_colors
@@ -192,17 +193,36 @@ def write_lowpoly_preview(
     out_path: Path,
     pieces: list[RawMesh],
     target_faces: int = 2000,
+    texture_image: Image.Image | None = None,
 ) -> tuple[int, int]:
-    """Decimated single-mesh preview, coloured per piece to match the
-    "Combined" webapp viewer (docs/OUTPUT_FORMAT.md section 2 -- UI only,
-    not read by Unity). Returns (vertex_count, face_count).
+    """Decimated single-mesh preview (docs/OUTPUT_FORMAT.md section 2 --
+    UI only, not read by Unity). Returns (vertex_count, face_count).
 
-    Each piece is decimated on its own, before merging, rather than
-    decimating the combined mesh and colouring after: a piece's colour is
-    uniform across all of its vertices, so re-applying it post-decimation
-    is exact, whereas trimesh's quadric decimation (a thin wrapper around
-    `fast_simplification`) drops vertex-colour/UV attributes entirely and
-    resets the result to a flat default grey.
+    All pieces are merged into one mesh -- welding shared piece-boundary
+    vertices together -- before decimating as a single pass, rather than
+    decimating each piece independently: independent per-piece decimation
+    moves each side of a shared seam on its own, tearing open gaps at
+    piece boundaries that used to be exactly coincident. Quadric edge
+    collapse never opens new holes in a mesh that's already
+    manifold/watertight at the seam, so welding first is what keeps the
+    result closed.
+
+    Attributes don't survive decimation (trimesh's quadric decimation, a
+    thin wrapper around `fast_simplification`, drops vertex-colour/UV and
+    resets the result to flat default grey), so after decimating a plain
+    position/face mesh, each surviving vertex's colour or UV is pulled
+    from its nearest pre-decimation *face corner* -- not the nearest
+    pre-decimation *vertex*: a UV atlas seam puts multiple valid UVs at
+    the same welded position (one per island touching there), and
+    collapsing those onto a single vertex-indexed UV before the nearest-
+    neighbour lookup would silently keep only the last one written,
+    smearing every seam's texture across the wrong island. Matching by
+    corner instead means every candidate UV stays available, and the
+    lookup picks whichever corner is geometrically closest.
+
+    When `texture_image` is given and every piece carries source UVs, the
+    preview is textured with the model's original material instead of the
+    flat per-piece colours the "Combined" webapp viewer uses.
     """
     from .stage10 import region_colors
 
@@ -211,26 +231,46 @@ def write_lowpoly_preview(
         out_path.write_bytes(trimesh.Trimesh().export(file_type="glb"))
         return 0, 0
 
+    use_texture = texture_image is not None and all(
+        p.uvs is not None and p.faces_uv is not None for p in pieces
+    )
     colours = region_colors(n_pieces)
-    total_faces = sum(p.face_count for p in pieces) or 1
 
-    decimated = []
+    positions_parts, faces_parts, colour_parts = [], [], []
+    corner_position_parts, corner_uv_parts = [], []
+    offset = 0
     for i, piece in enumerate(pieces):
-        mesh = trimesh.Trimesh(vertices=piece.positions, faces=piece.faces_pos, process=False)
-        budget = max(4, round(target_faces * piece.face_count / total_faces))
-        if len(mesh.faces) > budget:
-            mesh = mesh.simplify_quadric_decimation(face_count=budget)
+        positions_parts.append(piece.positions)
+        faces_parts.append(piece.faces_pos + offset)
+        if use_texture:
+            corner_position_parts.append(piece.positions[piece.faces_pos.reshape(-1)])
+            corner_uv_parts.append(piece.uvs[piece.faces_uv.reshape(-1)])
 
         r, g, b = colours[i]
         rgba = np.array([[int(r * 255), int(g * 255), int(b * 255), 255]], dtype=np.uint8)
-        mesh.visual = trimesh.visual.ColorVisuals(
-            mesh=mesh, vertex_colors=np.repeat(rgba, len(mesh.vertices), axis=0)
-        )
-        decimated.append(mesh)
+        colour_parts.append(np.repeat(rgba, len(piece.positions), axis=0))
+        offset += len(piece.positions)
 
-    combined = trimesh.util.concatenate(decimated)
-    out_path.write_bytes(combined.export(file_type="glb"))
-    return len(combined.vertices), len(combined.faces)
+    positions = np.concatenate(positions_parts, axis=0)
+    faces = np.concatenate(faces_parts, axis=0)
+    source_colours = np.concatenate(colour_parts, axis=0)
+
+    merged = trimesh.Trimesh(vertices=positions, faces=faces, process=True)
+    if len(merged.faces) > target_faces:
+        merged = merged.simplify_quadric_decimation(face_count=max(4, target_faces))
+
+    if use_texture:
+        corner_positions = np.concatenate(corner_position_parts, axis=0)
+        corner_uvs = np.concatenate(corner_uv_parts, axis=0)
+        _, nearest_corner = cKDTree(corner_positions).query(merged.vertices, k=1)
+        material = trimesh.visual.material.SimpleMaterial(image=texture_image)
+        merged.visual = trimesh.visual.TextureVisuals(uv=corner_uvs[nearest_corner], material=material)
+    else:
+        _, nearest_vertex = cKDTree(positions).query(merged.vertices, k=1)
+        merged.visual = trimesh.visual.ColorVisuals(mesh=merged, vertex_colors=source_colours[nearest_vertex])
+
+    out_path.write_bytes(merged.export(file_type="glb"))
+    return len(merged.vertices), len(merged.faces)
 
 
 def write_puzzle_output(
