@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from meshpartition.mesh_io import load_obj, save_obj
+from meshpartition.output import write_puzzle_output
 from meshpartition.pipeline import run_pipeline
 from meshpartition.stage10 import write_preview_obj
 
@@ -39,6 +40,7 @@ def main() -> None:
             result.working,
             result.relaxed.label,
         )
+        write_puzzle_output(job_dir, result.working, result.pieces)
 
         pieces_stats = [
             {

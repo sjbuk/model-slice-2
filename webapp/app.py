@@ -162,6 +162,8 @@ def job_status(job_id):
         payload["piece_urls"] = [
             f"/output/{job_id}/piece_{i:02d}.obj" for i in range(payload["piece_count"])
         ]
+        payload["pieces_glb"] = f"/output/{job_id}/pieces.glb"
+        payload["checkpoint_json"] = f"/output/{job_id}/checkpoint.json"
         source_name = job["source_name"]
         payload["source_url"] = f"/output/{job_id}/{source_name}"
         payload["source_type"] = Path(source_name).suffix.lstrip(".")

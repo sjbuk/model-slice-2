@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .mesh import RawMesh, WorkingMesh
+from .normalize import normalize_mesh
 from .stage0 import IngestStats, ingest
 from .stage1 import TriageResult, triage
 from .stage2 import BridgeResult, build_bridges
@@ -30,6 +31,7 @@ class PipelineResult:
 
 
 def run_pipeline(raw: RawMesh, n_pieces: int, force_exact_count: bool = False) -> PipelineResult:
+    raw = normalize_mesh(raw)
     working, stats = ingest(raw)
     tri = triage(working, n_pieces=n_pieces)
     bridges = build_bridges(working, tri, force_exact_count=force_exact_count)

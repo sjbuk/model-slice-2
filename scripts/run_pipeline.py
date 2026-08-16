@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from meshpartition.mesh_io import load_obj, save_obj
+from meshpartition.output import write_puzzle_output
 from meshpartition.pipeline import run_pipeline
 from meshpartition.stage10 import write_preview_obj
 
@@ -74,11 +75,12 @@ def main() -> None:
         working,
         relaxed.label,
     )
+    write_puzzle_output(out_dir, working, result.pieces)
 
     print()
     print(f"Wrote {len(result.pieces)} piece OBJ(s) + a colored combined preview to {out_dir}/")
     print(f"  Open {out_dir / 'preview.obj'} in Blender/MeshLab to see all pieces colored in one file.")
-    print(f"  Individual piece_NN.obj files are ready to import into Unity.")
+    print(f"  Wrote {out_dir / 'pieces.glb'} + {out_dir / 'checkpoint.json'} for the Unity consumer.")
 
 
 if __name__ == "__main__":
