@@ -69,7 +69,8 @@
     flex-wrap: wrap;
   }
   #controlsPanel label { display: flex; align-items: center; gap: 4px; }
-  #explodeControl input[type=range] { width: 110px; vertical-align: middle; }
+  #explodeControl input[type=range], #iterControl input[type=range] { width: 110px; vertical-align: middle; }
+  #iterReadout { color: #9aa0aa; }
 
   #simInfo {
     display: none; position: absolute; top: 10px; right: 10px; z-index: 5;
@@ -88,6 +89,9 @@
   <form id="sliceForm">
     <label>Model: <input type="file" id="modelFile" accept=".fbx,.glb,.obj" required></label>
     <label>Pieces: <input type="number" id="nPieces" value="8" min="2" max="200"></label>
+    <label title="Maximum number of Lloyd relaxation passes -- the algorithm stops early once pieces are balanced enough, so this only matters as an upper bound.">
+      Max iters: <input type="number" id="maxIters" value="15" min="1" max="50">
+    </label>
     <label title="Force exactly this many pieces by merging every disconnected part into its nearest piece, even across large real-world gaps. Off by default: pieces that can't plausibly merge become their own extra piece instead.">
       <input type="checkbox" id="forceExactCount"> Force exact count
     </label>
@@ -104,6 +108,10 @@
       <button type="button" id="resetViewBtn">Reset view</button>
       <div id="explodeControl" style="display:none">
         <label>Explode <input type="range" id="explodeSlider" min="0" max="1" step="0.01" value="0"></label>
+      </div>
+      <div id="iterControl" style="display:none">
+        <label>Iteration <input type="range" id="iterSlider" min="0" max="0" step="1" value="0"></label>
+        <span id="iterReadout"></span>
       </div>
     </div>
     <div id="simInfo"></div>
@@ -448,9 +456,57 @@ let explodeGroups = null; // Map(pieceIdx -> { group: THREE.Group, dir: THREE.Ve
 let explodeScale = 1;
 let simState = null;
 
+// Combined view's relax-iteration replay: { objGroup, replayMesh, colorAttr,
+// faceCount, labels, scores, maxDevs, bestIndex } once loadPreview() has
+// fetched mesh.json/iterations.json, else null (no replay data loaded/available).
+// bestIndex is NOT always the last iteration: relax() keeps whichever pass
+// scored best overall (area balance + seam + elongation), which can be an
+// earlier pass than the last one it ran -- see stage8.py's `best = min(...)`.
+// objGroup (the crisp OBJ view, loaded from preview.obj) is that same
+// best-scoring iteration, so it's shown exactly when the slider is at
+// bestIndex, not merely at the last position.
+let replayState = null;
+
 function setUiForMode(mode) {
   document.getElementById('explodeControl').style.display = mode === 'all' ? 'flex' : 'none';
   document.getElementById('simInfo').style.display = mode === 'simulate' ? 'block' : 'none';
+  if (mode !== 'combined') document.getElementById('iterControl').style.display = 'none';
+}
+
+// Recolors the replay mesh's vertex-color attribute in place for the given
+// iteration index -- no reload, no geometry rebuild, matching applyExplode's
+// cheap-transform pattern above. Each face gets one flat color repeated
+// across its 3 (non-indexed, so unshared) vertices.
+function recolorReplayMesh(iterIdx) {
+  const labels = replayState.labels[iterIdx];
+  const colors = replayState.colorAttr.array;
+  for (let f = 0; f < replayState.faceCount; f++) {
+    const c = hsvColor(labels[f] * GOLDEN_RATIO_CONJUGATE);
+    const base = f * 9; // 3 verts * 3 channels per face
+    for (let v = 0; v < 3; v++) {
+      colors[base + v * 3] = c.r;
+      colors[base + v * 3 + 1] = c.g;
+      colors[base + v * 3 + 2] = c.b;
+    }
+  }
+  replayState.colorAttr.needsUpdate = true;
+}
+
+function applyIterSlider() {
+  if (!replayState) return;
+  const idx = parseInt(document.getElementById('iterSlider').value, 10);
+  const isBest = idx === replayState.bestIndex;
+  // Only at the actual best-scoring iteration does the crisp per-object OBJ
+  // view (loaded from preview.obj, which IS that iteration's result) apply --
+  // every other position, including a later one, is a discarded pass shown
+  // via the replay mesh only.
+  replayState.objGroup.visible = isBest;
+  replayState.replayMesh.visible = !isBest;
+  if (!isBest) recolorReplayMesh(idx);
+  const suffix = isBest ? ' — ✓ selected (best score)' : ' — not used (higher score than the selected iteration)';
+  document.getElementById('iterReadout').textContent =
+    `${idx + 1} / ${replayState.labels.length} — score ${replayState.scores[idx].toFixed(4)}, ` +
+    `max dev ${(replayState.maxDevs[idx] * 100).toFixed(1)}%${suffix}`;
 }
 
 function applyExplode() {
@@ -721,6 +777,7 @@ function clearScene() {
     simState = null;
   }
   explodeGroups = null;
+  replayState = null;
   pieceMeshRegistry = new Map();
   hoveredPieceIdx = null;
   controls.enabled = true;
@@ -738,6 +795,7 @@ function clearScene() {
 }
 
 document.getElementById('explodeSlider').addEventListener('input', applyExplode);
+document.getElementById('iterSlider').addEventListener('input', applyIterSlider);
 
 // Layouts call this unconditionally after loading, but we only actually
 // want to move the camera the first time a given model is shown -- once
@@ -769,7 +827,49 @@ function frameCameraOnScene(force) {
   cameraHasBeenFramed = true;
 }
 
-async function loadPreview(objUrl, mtlUrl) {
+// Builds the replay mesh -- one THREE.Mesh reused across every scrub step,
+// its vertex-color attribute rewritten in place per iteration
+// (recolorReplayMesh) rather than reloading a file per step. Non-indexed
+// (each face gets its own 3 unshared vertices) so a face's flat color never
+// bleeds into a welded neighbor's.
+function buildReplayMesh(meshData, iterationsData) {
+  const positions = meshData.positions;
+  const faces = meshData.faces;
+  const faceCount = faces.length;
+
+  const posArray = new Float32Array(faceCount * 9);
+  for (let f = 0; f < faceCount; f++) {
+    const [a, b, c] = faces[f];
+    const base = f * 9;
+    [a, b, c].forEach((vi, k) => {
+      const p = positions[vi];
+      posArray[base + k * 3] = p[0];
+      posArray[base + k * 3 + 1] = p[1];
+      posArray[base + k * 3 + 2] = p[2];
+    });
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+  const colorAttr = new THREE.BufferAttribute(new Float32Array(faceCount * 9), 3);
+  geometry.setAttribute('color', colorAttr);
+  geometry.computeVertexNormals();
+
+  const material = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, roughness: 0.7 });
+  const replayMesh = new THREE.Mesh(geometry, material);
+  replayMesh.visible = false;
+  contentGroup.add(replayMesh);
+
+  return {
+    replayMesh, colorAttr, faceCount,
+    labels: iterationsData.labels,
+    scores: iterationsData.scores,
+    maxDevs: iterationsData.max_area_deviations,
+    bestIndex: iterationsData.best_index,
+  };
+}
+
+async function loadPreview(objUrl, mtlUrl, iterationsUrl, meshUrl) {
   clearScene();
   const [objText, mtlText] = await Promise.all([
     fetch(objUrl).then(r => r.text()),
@@ -792,6 +892,20 @@ async function loadPreview(objUrl, mtlUrl) {
     const m = child.name.match(/^piece_(\d+)$/);
     if (m) pieceMeshRegistry.set(parseInt(m[1], 10), [child]);
   });
+
+  if (iterationsUrl && meshUrl) {
+    const [meshData, iterationsData] = await Promise.all([
+      fetch(meshUrl).then(r => r.json()),
+      fetch(iterationsUrl).then(r => r.json()),
+    ]);
+    replayState = buildReplayMesh(meshData, iterationsData);
+    replayState.objGroup = group;
+    const iterSlider = document.getElementById('iterSlider');
+    iterSlider.max = String(replayState.labels.length - 1);
+    iterSlider.value = String(replayState.bestIndex); // default to the actually-selected iteration
+    document.getElementById('iterControl').style.display = 'flex';
+    applyIterSlider();
+  }
 
   frameCameraOnScene();
   applyUvChecker(document.getElementById('uvChk').checked);
@@ -964,7 +1078,7 @@ const PIECE_LAYOUTS = new Set(['all', 'simulate']);
 function renderCurrentLayout() {
   if (!lastResult || !activeLayoutKey) return;
   const data = lastResult;
-  if (activeLayoutKey === 'combined') loadPreview(data.preview_obj, data.preview_mtl);
+  if (activeLayoutKey === 'combined') loadPreview(data.preview_obj, data.preview_mtl, data.iterations_json, data.mesh_json);
   else if (activeLayoutKey === 'original') loadSourcePreview(data.source_url, data.source_type);
   else if (activeLayoutKey === 'all') loadAllPiecesSeparately(data.piece_urls);
   else if (activeLayoutKey === 'simulate') loadSimulate(data.piece_urls, data.checkpoint_json);
@@ -1018,6 +1132,7 @@ form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const fileInput = document.getElementById('modelFile');
   const nPieces = document.getElementById('nPieces').value;
+  const maxIters = document.getElementById('maxIters').value;
   const forceExactCount = document.getElementById('forceExactCount').checked;
   if (!fileInput.files.length) return;
 
@@ -1031,6 +1146,7 @@ form.addEventListener('submit', async (e) => {
   const fd = new FormData();
   fd.append('model', fileInput.files[0]);
   fd.append('n_pieces', nPieces);
+  fd.append('max_iterations', maxIters);
   fd.append('force_exact_count', forceExactCount ? '1' : '0');
 
   try {

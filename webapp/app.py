@@ -28,6 +28,7 @@ sys.path.insert(0, str(APP_ROOT / "src"))
 
 from meshpartition.mesh_io import load_obj  # noqa: E402
 from meshpartition.output import write_lowpoly_preview  # noqa: E402
+from meshpartition.stage8 import DEFAULT_I_MAX  # noqa: E402
 
 ALLOWED_EXTENSIONS = {".fbx", ".obj", ".glb"}
 
@@ -80,6 +81,13 @@ def slice_model():
     if n_pieces < 2:
         return jsonify(error="n_pieces must be at least 2."), 400
 
+    try:
+        max_iterations = int(request.form.get("max_iterations", DEFAULT_I_MAX))
+    except ValueError:
+        return jsonify(error="max_iterations must be an integer."), 400
+    if not (1 <= max_iterations <= 50):
+        return jsonify(error="max_iterations must be between 1 and 50."), 400
+
     force_exact_count = request.form.get("force_exact_count", "").lower() in ("1", "true", "on")
 
     job_id = uuid.uuid4().hex[:12]
@@ -115,6 +123,7 @@ def slice_model():
             str(job_dir),
             "1" if force_exact_count else "0",
             file.filename,
+            str(max_iterations),
         ]
     )
     with JOBS_LOCK:
@@ -179,6 +188,8 @@ def job_status(job_id):
         ]
         payload["pieces_glb"] = f"/output/{job_id}/pieces.glb"
         payload["checkpoint_json"] = f"/output/{job_id}/checkpoint.json"
+        payload["mesh_json"] = f"/output/{job_id}/mesh.json"
+        payload["iterations_json"] = f"/output/{job_id}/iterations.json"
         source_name = job["source_name"]
         payload["source_url"] = f"/output/{job_id}/{source_name}"
         payload["source_type"] = Path(source_name).suffix.lstrip(".")

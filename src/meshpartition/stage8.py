@@ -72,6 +72,9 @@ class RelaxationResult:
     iterations_run: int
     converged: bool
     scores: list[float] = field(default_factory=list)  # per iteration, in order
+    iteration_labels: list[np.ndarray] = field(default_factory=list)  # per iteration, in order
+    iteration_max_area_deviations: list[float] = field(default_factory=list)  # per iteration, in order
+    best_iteration_index: int = 0  # index into the lists above of the retained (lowest-score) iteration
 
 
 def _max_area_deviation(region_area: np.ndarray, abar: float) -> float:
@@ -252,7 +255,7 @@ def relax(
         current_alpha = new_repaired.next_alpha
         iterations_run += 1
 
-    best = min(records, key=lambda r: r.score)
+    best_index, best = min(enumerate(records), key=lambda p: p[1].score)
 
     return RelaxationResult(
         label=best.label,
@@ -262,4 +265,7 @@ def relax(
         iterations_run=iterations_run,
         converged=records[-1].max_area_deviation <= epsilon_bal,
         scores=[r.score for r in records],
+        iteration_labels=[r.label for r in records],
+        iteration_max_area_deviations=[r.max_area_deviation for r in records],
+        best_iteration_index=best_index,
     )

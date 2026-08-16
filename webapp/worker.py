@@ -14,12 +14,15 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from meshpartition.mesh_io import load_obj, save_obj
 from meshpartition.output import write_puzzle_output
 from meshpartition.pipeline import run_pipeline
 from meshpartition.progress import PHASE_NAMES, ProgressReporter
+from meshpartition.stage8 import DEFAULT_I_MAX
 from meshpartition.stage10 import write_preview_obj
 
 # "load" isn't one of pipeline.py's stages -- it's parsing the (possibly
@@ -53,6 +56,7 @@ def main() -> None:
     obj_path, n_pieces, job_dir = sys.argv[1], int(sys.argv[2]), Path(sys.argv[3])
     force_exact_count = len(sys.argv) > 4 and sys.argv[4] == "1"
     source_name = sys.argv[5] if len(sys.argv) > 5 else Path(obj_path).name
+    max_iterations = int(sys.argv[6]) if len(sys.argv) > 6 else DEFAULT_I_MAX
     result_path = job_dir / "result.json"
 
     reporter = ProgressReporter(
@@ -64,7 +68,11 @@ def main() -> None:
             raw = load_obj(obj_path)
         t0 = time.perf_counter()
         result = run_pipeline(
-            raw, n_pieces=n_pieces, force_exact_count=force_exact_count, progress=reporter
+            raw,
+            n_pieces=n_pieces,
+            force_exact_count=force_exact_count,
+            i_max=max_iterations,
+            progress=reporter,
         )
         elapsed = time.perf_counter() - t0
 
@@ -77,6 +85,26 @@ def main() -> None:
             result.relaxed.label,
         )
         write_puzzle_output(job_dir, result.working, result.pieces)
+
+        # Replay data for the web UI's iteration scrubber: the raw mesh
+        # geometry once (mesh.json) plus every Lloyd pass's per-face labels
+        # (iterations.json), so the client can recolor the same geometry in
+        # place per iteration instead of re-fetching a full OBJ per step.
+        # Compact (no pretty-printing) since these can be a few MB for a real
+        # mesh with several iterations.
+        mesh_payload = {
+            "positions": np.round(result.working.positions, 6).tolist(),
+            "faces": result.working.faces_pos.tolist(),
+        }
+        (job_dir / "mesh.json").write_text(json.dumps(mesh_payload, separators=(",", ":")))
+
+        iterations_payload = {
+            "labels": [label.tolist() for label in result.relaxed.iteration_labels],
+            "scores": result.relaxed.scores,
+            "max_area_deviations": result.relaxed.iteration_max_area_deviations,
+            "best_index": result.relaxed.best_iteration_index,
+        }
+        (job_dir / "iterations.json").write_text(json.dumps(iterations_payload, separators=(",", ":")))
 
         pieces_stats = [
             {

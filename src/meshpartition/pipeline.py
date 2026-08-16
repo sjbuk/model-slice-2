@@ -17,7 +17,7 @@ from .stage4 import build_dual_graph
 from .stage5 import seed
 from .stage6 import grow
 from .stage7 import repair
-from .stage8 import RelaxationResult, relax
+from .stage8 import DEFAULT_I_MAX, RelaxationResult, relax
 from .stage10 import extract
 
 
@@ -36,6 +36,7 @@ def run_pipeline(
     raw: RawMesh,
     n_pieces: int,
     force_exact_count: bool = False,
+    i_max: int = DEFAULT_I_MAX,
     progress: ProgressReporter | None = None,
 ) -> PipelineResult:
     if progress is None:
@@ -58,7 +59,7 @@ def run_pipeline(
     with progress.stage(PHASE_NAMES[7]):
         repaired = repair(working, graph, tri, bridges, growth)
     with progress.stage(PHASE_NAMES[8]):
-        relaxed = relax(working, graph, tri, bridges, seed_result, growth, repaired, progress=progress)
+        relaxed = relax(working, graph, tri, bridges, seed_result, growth, repaired, i_max=i_max, progress=progress)
     with progress.stage(PHASE_NAMES[9]):
         pieces = extract(working, relaxed.label)
     return PipelineResult(
