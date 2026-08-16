@@ -20,6 +20,7 @@ import trimesh
 from PIL import Image
 
 from .mesh import RawMesh, WorkingMesh
+from .stage10 import region_colors
 from .util import triangle_areas, triangle_centroids
 
 ATLAS_CELL_PX = 32
@@ -185,6 +186,51 @@ def write_checkpoint(
     }
 
     out_path.write_text(json.dumps(payload, indent=2))
+
+
+def write_lowpoly_preview(
+    out_path: Path,
+    pieces: list[RawMesh],
+    target_faces: int = 2000,
+) -> tuple[int, int]:
+    """Decimated single-mesh preview, coloured per piece to match the
+    "Combined" webapp viewer (docs/OUTPUT_FORMAT.md section 2 -- UI only,
+    not read by Unity). Returns (vertex_count, face_count).
+
+    Each piece is decimated on its own, before merging, rather than
+    decimating the combined mesh and colouring after: a piece's colour is
+    uniform across all of its vertices, so re-applying it post-decimation
+    is exact, whereas trimesh's quadric decimation (a thin wrapper around
+    `fast_simplification`) drops vertex-colour/UV attributes entirely and
+    resets the result to a flat default grey.
+    """
+    from .stage10 import region_colors
+
+    n_pieces = len(pieces)
+    if n_pieces == 0:
+        out_path.write_bytes(trimesh.Trimesh().export(file_type="glb"))
+        return 0, 0
+
+    colours = region_colors(n_pieces)
+    total_faces = sum(p.face_count for p in pieces) or 1
+
+    decimated = []
+    for i, piece in enumerate(pieces):
+        mesh = trimesh.Trimesh(vertices=piece.positions, faces=piece.faces_pos, process=False)
+        budget = max(4, round(target_faces * piece.face_count / total_faces))
+        if len(mesh.faces) > budget:
+            mesh = mesh.simplify_quadric_decimation(face_count=budget)
+
+        r, g, b = colours[i]
+        rgba = np.array([[int(r * 255), int(g * 255), int(b * 255), 255]], dtype=np.uint8)
+        mesh.visual = trimesh.visual.ColorVisuals(
+            mesh=mesh, vertex_colors=np.repeat(rgba, len(mesh.vertices), axis=0)
+        )
+        decimated.append(mesh)
+
+    combined = trimesh.util.concatenate(decimated)
+    out_path.write_bytes(combined.export(file_type="glb"))
+    return len(combined.vertices), len(combined.faces)
 
 
 def write_puzzle_output(

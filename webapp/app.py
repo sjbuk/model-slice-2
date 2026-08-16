@@ -8,6 +8,7 @@ itself can take a while.
 
 from __future__ import annotations
 
+import base64
 import json
 import subprocess
 import sys
@@ -23,6 +24,11 @@ OUTPUT_ROOT = APP_ROOT / "output" / "web"
 WORKER_SCRIPT = Path(__file__).resolve().parent / "worker.py"
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
+sys.path.insert(0, str(APP_ROOT / "src"))
+
+from meshpartition.mesh_io import load_obj  # noqa: E402
+from meshpartition.output import write_lowpoly_preview  # noqa: E402
+
 ALLOWED_EXTENSIONS = {".fbx", ".obj", ".glb"}
 
 # Hard cutoff for a slicing job. Stage 8's relaxation re-seeding can run long
@@ -30,7 +36,7 @@ ALLOWED_EXTENSIONS = {".fbx", ".obj", ".glb"}
 # bridge search scales with satellite/major face counts on messy real-world
 # assets -- past this, a job is presumed stuck rather than left running (and
 # polled) forever.
-JOB_TIME_BUDGET_SECONDS = 600
+JOB_TIME_BUDGET_SECONDS = 7200
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB uploads
@@ -169,6 +175,81 @@ def job_status(job_id):
         payload["source_type"] = Path(source_name).suffix.lstrip(".")
     job["response"] = payload
     return jsonify(payload)
+
+
+def _decode_data_url_png(data_url: str) -> bytes:
+    prefix = "data:image/png;base64,"
+    if not data_url.startswith(prefix):
+        raise ValueError("image must be a base64 data:image/png URL.")
+    return base64.b64decode(data_url[len(prefix):])
+
+
+@app.route("/api/jobs/<job_id>/save", methods=["POST"])
+def save_job(job_id):
+    """Writes preview.png and lowpoly_preview.glb -- the two UI-only assets
+    from docs/OUTPUT_FORMAT.md section 2 the core generator never produced
+    -- and merges the saved camera pose (+ optional puzzle name) into
+    checkpoint.json, preserving whatever fields are already there (section 6).
+
+    The image and the low-poly mesh are both built to match how the puzzle
+    looked in the browser at Save time: the image is a client-captured
+    screenshot of the live viewport (not a server-side re-render from some
+    fixed angle), and the low-poly mesh reuses the same per-piece colouring
+    the "Combined" viewer already shows, in the same assembled coordinate
+    space pieces.glb/checkpoint.json already use -- so nothing needs to be
+    re-oriented to match what the user was looking at.
+    """
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if job is None:
+        return jsonify(error="Unknown job id."), 404
+    if not job["response"] or job["response"].get("status") != "done":
+        return jsonify(error="Job has not finished slicing yet."), 409
+
+    body = request.get_json(silent=True) or {}
+    image_data_url = body.get("image")
+    orientation = body.get("orientation")
+    name = body.get("name")
+
+    if not image_data_url:
+        return jsonify(error="Missing 'image' (base64 PNG data URL)."), 400
+    if (
+        not isinstance(orientation, dict)
+        or "position" not in orientation
+        or "target" not in orientation
+    ):
+        return jsonify(error="Missing 'orientation' ({position, target})."), 400
+
+    job_dir: Path = job["job_dir"]
+
+    try:
+        png_bytes = _decode_data_url_png(image_data_url)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    (job_dir / "preview.png").write_bytes(png_bytes)
+
+    piece_count = job["response"]["piece_count"]
+    pieces = [load_obj(str(job_dir / f"piece_{i:02d}.obj")) for i in range(piece_count)]
+    lowpoly_vertices, lowpoly_faces = write_lowpoly_preview(job_dir / "lowpoly_preview.glb", pieces)
+
+    checkpoint_path = job_dir / "checkpoint.json"
+    checkpoint = json.loads(checkpoint_path.read_text())
+    checkpoint["orientation"] = {
+        "position": [float(x) for x in orientation["position"]],
+        "target": [float(x) for x in orientation["target"]],
+    }
+    checkpoint["lowpoly_vertices"] = lowpoly_vertices
+    checkpoint["lowpoly_faces"] = lowpoly_faces
+    if name:
+        checkpoint["name"] = name
+    checkpoint_path.write_text(json.dumps(checkpoint, indent=2))
+
+    return jsonify(
+        status="saved",
+        preview_png=f"/output/{job_id}/preview.png",
+        lowpoly_preview_glb=f"/output/{job_id}/lowpoly_preview.glb",
+        checkpoint_json=f"/output/{job_id}/checkpoint.json",
+    )
 
 
 @app.route("/output/<path:filename>")

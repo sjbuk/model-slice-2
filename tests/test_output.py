@@ -9,7 +9,7 @@ import pytest
 import trimesh
 
 from meshpartition.normalize import normalize_mesh
-from meshpartition.output import compute_adjacency, write_puzzle_output
+from meshpartition.output import compute_adjacency, write_lowpoly_preview, write_puzzle_output
 from meshpartition.pipeline import run_pipeline
 
 from fixtures import fixture_a_sphere, fixture_c_shirt
@@ -110,6 +110,26 @@ def test_checkpoint_adjacency_symmetric(tmp_path):
         assert a != b
         reverse = by_pair[(b, a)]
         assert np.allclose(offset, [-x for x in reverse])
+
+
+def test_lowpoly_preview_decimates_and_colours_per_piece(tmp_path):
+    """lowpoly_preview.glb -- single decimated mesh, one flat colour per piece,
+    face count close to (not exceeding by much) the requested budget."""
+    result = run_pipeline(fixture_c_shirt(), n_pieces=6)
+    out_path = tmp_path / "lowpoly_preview.glb"
+
+    n_vertices, n_faces = write_lowpoly_preview(out_path, result.pieces, target_faces=120)
+
+    mesh = trimesh.load(out_path, force="mesh")
+    assert len(mesh.vertices) == n_vertices
+    assert len(mesh.faces) == n_faces
+    assert n_faces <= 6 * max(4, round(120 / 6)) + 6 * 4  # per-piece budget, generous slack
+    assert n_faces > 0
+
+    colours = mesh.visual.vertex_colors
+    # Each vertex belongs to exactly one (undecimated-per-piece) coloured
+    # region -- confirm more than one distinct colour survived merging.
+    assert len({tuple(c) for c in colours}) > 1
 
 
 def test_adjacency_threshold_touching_vs_separated():

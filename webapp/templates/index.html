@@ -103,6 +103,17 @@
       <h2>Result</h2>
       <div id="summary"></div>
 
+      <h2>Save</h2>
+      <div id="saveBlock">
+        <label style="display:flex; gap:6px; align-items:center; margin-bottom:8px;">
+          Name
+          <input type="text" id="puzzleName" placeholder="My Puzzle"
+                 style="flex:1; background:#33363f; color:#eee; border:1px solid #4a4d57; border-radius:4px; padding:4px 6px; font-size:13px;">
+        </label>
+        <button type="button" id="saveBtn" title="Saves a thumbnail and a decimated preview mesh of the puzzle exactly as currently framed in the viewport.">Save puzzle output</button>
+        <div id="saveStatus" style="margin-top:8px; color:#9aa0aa;"></div>
+      </div>
+
       <h2>Layout</h2>
       <div class="viewToggle" id="layoutToggle">
         <button type="button" data-layout="combined">Combined (colored)</button>
@@ -149,7 +160,11 @@ scene.background = new THREE.Color(DARK_BG);
 const camera = new THREE.PerspectiveCamera(50, viewport.clientWidth / viewport.clientHeight, 0.001, 10000);
 camera.position.set(1, 1, 1);
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+// preserveDrawingBuffer keeps the last-rendered frame in the drawing buffer
+// after compositing, so the Save action's canvas.toDataURL() capture (see
+// saveBtn handler below) reliably gets real pixels instead of a
+// browser-dependent race with the buffer clear that normally follows each frame.
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
 renderer.setSize(viewport.clientWidth, viewport.clientHeight);
 renderer.setPixelRatio(window.devicePixelRatio);
 // Without this, the renderer treats its linear lighting output as if it
@@ -997,7 +1012,7 @@ function pollJob(jobId) {
     }
 
     if (data.status === 'running') {
-      setStatus(`Slicing... ${data.elapsed_seconds}s elapsed. Multi-pass relaxation on real-world meshes can take a while (see the Stage 8 note in the project README) -- this will be stopped automatically after 10 minutes if it's stuck.`);
+      setStatus(`Slicing... ${data.elapsed_seconds}s elapsed. Multi-pass relaxation on real-world meshes can take a while (see the Stage 8 note in the project README) -- this will be stopped automatically after 2 hours if it's stuck.`);
       return;
     }
 
@@ -1067,6 +1082,49 @@ function renderResult(data) {
 
   selectLayout('combined');
 }
+
+// ---------------------------------------------------------------------
+// Save action -- writes preview.png and lowpoly_preview.glb (the two UI-only
+// assets docs/OUTPUT_FORMAT.md describes but the generator doesn't produce)
+// plus the camera pose, captured exactly as the viewport currently looks --
+// whatever layout/angle/zoom the user left it at -- rather than some fixed
+// re-render, so the saved thumbnail always matches what was actually being
+// looked at when Save was clicked.
+// ---------------------------------------------------------------------
+const saveBtn = document.getElementById('saveBtn');
+const saveStatus = document.getElementById('saveStatus');
+
+saveBtn.addEventListener('click', async () => {
+  if (!lastResult) return;
+  saveBtn.disabled = true;
+  saveStatus.textContent = 'Saving...';
+
+  try {
+    renderer.render(scene, camera); // freshest frame before capture
+    const image = renderer.domElement.toDataURL('image/png');
+    const orientation = {
+      position: camera.position.toArray(),
+      target: controls.target.toArray(),
+    };
+    const name = document.getElementById('puzzleName').value.trim();
+
+    const resp = await fetch(`/api/jobs/${lastResult.job_id}/save`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image, orientation, name: name || undefined }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      saveStatus.textContent = data.error || `Save failed (${resp.status}).`;
+      return;
+    }
+    saveStatus.innerHTML = `Saved. <a class="dl" href="${data.preview_png}" target="_blank">preview.png</a> &middot; <a class="dl" href="${data.lowpoly_preview_glb}" target="_blank">lowpoly_preview.glb</a>`;
+  } catch (err) {
+    saveStatus.textContent = `Save failed: ${err}`;
+  } finally {
+    saveBtn.disabled = false;
+  }
+});
 </script>
 </body>
 </html>
