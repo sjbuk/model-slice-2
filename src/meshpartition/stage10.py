@@ -60,9 +60,18 @@ def extract(working: WorkingMesh, label: np.ndarray) -> list[RawMesh]:
     return pieces
 
 
+GOLDEN_RATIO_CONJUGATE = 0.6180339887498949
+
+
 def region_colors(n_regions: int) -> list[tuple[float, float, float]]:
-    """Deterministic, evenly-spaced hues -- one distinct color per region id."""
-    return [colorsys.hsv_to_rgb((i / n_regions) % 1.0, 0.65, 0.95) for i in range(n_regions)]
+    """Per-piece color, golden-ratio-spaced hue in HSL.
+
+    Must match the webapp viewer's client-side `hsvColor()` (same hue
+    formula, same HSL model, same saturation/lightness) so a piece's color
+    in the "Combined" preview matches its color everywhere else the viewer
+    shows it (piece list swatches, All pieces, Exploded, Test construction).
+    """
+    return [colorsys.hls_to_rgb((i * GOLDEN_RATIO_CONJUGATE) % 1.0, 0.55, 0.65) for i in range(n_regions)]
 
 
 def write_preview_obj(path_obj: str, path_mtl: str, working: WorkingMesh, label: np.ndarray) -> None:

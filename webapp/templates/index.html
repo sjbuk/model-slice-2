@@ -40,17 +40,29 @@
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th, td { text-align: left; padding: 3px 4px; border-bottom: 1px solid #33363f; }
   th { color: #9aa0aa; font-weight: 500; }
+  tbody tr:hover { background: #2a2d36; }
+
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
 
   .viewToggle { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
   .viewToggle button { background: #33363f; padding: 4px 9px; font-size: 12px; font-weight: 400; }
   .viewToggle button.active { background: #4a6ef2; }
+  .viewToggle button:disabled { background: #2a2c33; color: #666; cursor: not-allowed; }
 
   #controlsPanel {
     position: absolute; top: 10px; left: 10px; z-index: 5;
     background: rgba(20,20,24,0.8); padding: 8px 12px; border-radius: 6px;
     font-size: 12px; display: flex; gap: 12px; align-items: center;
+    flex-wrap: wrap;
   }
   #controlsPanel label { display: flex; align-items: center; gap: 4px; }
+  #explodeControl input[type=range] { width: 110px; vertical-align: middle; }
+
+  #simInfo {
+    display: none; position: absolute; top: 10px; right: 10px; z-index: 5;
+    background: rgba(20,20,24,0.85); padding: 8px 12px; border-radius: 6px;
+    font-size: 12px; max-width: 260px; line-height: 1.4;
+  }
 
   a.dl { color: #8ab4f8; text-decoration: none; }
   a.dl:hover { text-decoration: underline; }
@@ -77,7 +89,11 @@
       <label><input type="checkbox" id="uvChk"> UV checker</label>
       <label><input type="checkbox" id="bgChk"> Light background</label>
       <button type="button" id="resetViewBtn">Reset view</button>
+      <div id="explodeControl" style="display:none">
+        <label>Explode <input type="range" id="explodeSlider" min="0" max="1" step="0.01" value="0"></label>
+      </div>
     </div>
+    <div id="simInfo"></div>
   </div>
   <div id="sidebar">
     <h2>Status</h2>
@@ -87,12 +103,23 @@
       <h2>Result</h2>
       <div id="summary"></div>
 
-      <h2>View</h2>
-      <div class="viewToggle" id="viewToggle"></div>
+      <h2>Layout</h2>
+      <div class="viewToggle" id="layoutToggle">
+        <button type="button" data-layout="combined">Combined (colored)</button>
+        <button type="button" data-layout="original">Original model</button>
+        <button type="button" data-layout="all">All pieces (separate)</button>
+        <button type="button" data-layout="simulate">Test construction</button>
+      </div>
+
+      <h2 id="materialHeading" style="display:none">Material</h2>
+      <div class="viewToggle" id="materialToggle" style="display:none">
+        <button type="button" id="materialColoredBtn" class="active">Colored</button>
+        <button type="button" id="materialTexturedBtn">Textured</button>
+      </div>
 
       <h2>Pieces</h2>
       <table>
-        <thead><tr><th>#</th><th>Faces</th><th>Area dev.</th><th></th></tr></thead>
+        <thead><tr><th></th><th>#</th><th>Faces</th><th>Area dev.</th><th></th></tr></thead>
         <tbody id="piecesTable"></tbody>
       </table>
     </div>
@@ -125,6 +152,12 @@ camera.position.set(1, 1, 1);
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(viewport.clientWidth, viewport.clientHeight);
 renderer.setPixelRatio(window.devicePixelRatio);
+// Without this, the renderer treats its linear lighting output as if it
+// were already display-ready -- correct color/texture display (especially
+// glTF/FBX PBR base-color maps, which are authored in sRGB) needs this
+// conversion on the way out. Missing it is the classic cause of "my loaded
+// model looks too dark" in three.js.
+renderer.outputEncoding = THREE.sRGBEncoding;
 viewport.appendChild(renderer.domElement);
 
 const controls = new THREE.OrbitControls(camera, renderer.domElement);
@@ -137,6 +170,9 @@ scene.add(keyLight);
 const fillLight = new THREE.DirectionalLight(0xffffff, 0.35);
 fillLight.position.set(-4, -2, -3);
 scene.add(fillLight);
+// Soft sky/ground fill so uploaded models with no scene lighting of their
+// own (the common case) don't rely purely on the two directional lights.
+scene.add(new THREE.HemisphereLight(0xffffff, 0x40404a, 0.6));
 
 const contentGroup = new THREE.Group();
 scene.add(contentGroup);
@@ -147,9 +183,19 @@ new ResizeObserver(() => {
   renderer.setSize(viewport.clientWidth, viewport.clientHeight);
 }).observe(viewport);
 
+// Declared here (ahead of animate()'s first call) rather than down with the
+// rest of the per-piece-layout state below -- the render loop's very first
+// frame can fire before the remainder of this synchronous script finishes
+// running, and referencing a not-yet-initialized `let` from that frame
+// throws a TDZ error instead of just seeing `undefined`.
+let pieceMeshRegistry = new Map(); // pieceIdx -> Object3D[]
+let hoveredPieceIdx = null;
+const HIGHLIGHT_COLOR = new THREE.Color(0xffcc55);
+
 (function animate() {
   requestAnimationFrame(animate);
   controls.update();
+  updateHoverPulse();
   renderer.render(scene, camera);
 })();
 
@@ -206,7 +252,445 @@ function applyUvChecker(on) {
   applyWireframe();
 }
 
+// ---------------------------------------------------------------------
+// Per-piece layouts (All pieces / Exploded / Test construction) share:
+//  - a coloring/material helper (materialMode: colored vs textured),
+//    independent of which layout is showing them;
+//  - a registry mapping piece index -> the Object3D(s) representing that
+//    piece in whichever layout is currently loaded, used by the piece
+//    list's hover highlight so it works the same in every layout.
+// Exploded view and Test construction are ported from the standalone
+// tauri-app's PieceViewer.svelte split/simulate view modes. Both work off
+// pieces that keep their true assembled-space vertex coordinates, so
+// "explode" and "return to true position" are always just a translation
+// offset applied on top of a Group wrapping the unmodified geometry --
+// never a rewrite of the vertices themselves.
+// ---------------------------------------------------------------------
+let materialMode = 'colored'; // 'colored' | 'textured'
+let sourceMaterial = null;
+let sourceMaterialPromise = null;
+
+// All texture-map slots a Material subclass might carry, all sampled from
+// the same primary UV channel our OBJ geometry has (aoMap/lightMap, which
+// conventionally read a second UV channel we don't have, are deliberately
+// excluded -- there's no uv2 to flip them against).
+const MATERIAL_MAP_SLOTS = ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'emissiveMap', 'bumpMap', 'displacementMap', 'alphaMap'];
+const COLOR_SPACE_MAP_SLOTS = new Set(['map', 'emissiveMap']);
+
+function pieceMaterial(idx) {
+  if (materialMode === 'textured' && sourceMaterial) {
+    return sourceMaterial.clone();
+  }
+  return new THREE.MeshStandardMaterial({ color: hsvColor(idx * GOLDEN_RATIO_CONJUGATE), side: THREE.DoubleSide, roughness: 0.7 });
+}
+
+// Pulls the first fully-textured material off the original upload, for
+// "Textured" mode on the piece-based layouts -- their OBJ geometry keeps
+// the source mesh's original UVs (see mesh_io.save_obj), so the same
+// material maps onto individual/exploded/simulated pieces correctly.
+// Cloning the whole material (not just its base-color map) is what keeps
+// metalness/roughness/normal/emissive/transparency looking like the
+// original instead of a flat, matte re-coloring. Only the first material
+// found is used -- a reasonable approximation for typical single-material
+// assets, not a full multi-material solution. OBJ uploads can't have a
+// texture (no companion file is uploaded alongside the .obj), so resolve
+// to null immediately without a network round-trip.
+async function extractMaterial(url, type) {
+  if (type !== 'glb' && type !== 'fbx') return null;
+  let group;
+  try {
+    if (type === 'glb') {
+      group = (await loadWithCallbackLoader(new THREE.GLTFLoader(), url)).scene;
+    } else {
+      group = await loadWithCallbackLoader(new THREE.FBXLoader(), url);
+    }
+  } catch {
+    return null;
+  }
+  let found = null;
+  group.traverse(c => {
+    if (found || !c.isMesh || !c.material) return;
+    const mats = Array.isArray(c.material) ? c.material : [c.material];
+    for (const m of mats) {
+      if (m && m.map) { found = m; break; }
+    }
+  });
+  if (!found) return null;
+
+  const material = found.clone();
+  material.side = THREE.DoubleSide;
+
+  for (const slot of MATERIAL_MAP_SLOTS) {
+    const tex = material[slot];
+    if (!tex) continue;
+    if (COLOR_SPACE_MAP_SLOTS.has(slot)) tex.encoding = THREE.sRGBEncoding;
+    if (type === 'glb') {
+      // GLTFLoader vends textures assuming glTF's V-down-from-top UV
+      // convention (texture.flipY left false). The per-piece OBJ geometry
+      // this material gets applied to carries UVs that went through the
+      // server-side GLB->OBJ conversion (assimp), which re-expresses them
+      // in traditional OBJ/OpenGL V-up-from-bottom space -- without
+      // correcting for that here, every map samples the wrong texel per
+      // fragment and renders as an incoherent, washed-out mess rather than
+      // a simple upside-down mirror. Flip V via each texture's own UV
+      // transform (v' = 1 - v) rather than toggling texture.flipY, which
+      // would require a GPU re-upload and doesn't compose as cleanly with
+      // the sRGB encoding set above. Every map on this material shares the
+      // same UV channel, so they all need the same correction.
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.RepeatWrapping;
+      tex.repeat.y = -1;
+      tex.offset.y = 1;
+      tex.needsUpdate = true;
+    }
+    // FBX's own UV convention already matches OBJ's (both V-up-from-bottom,
+    // unlike glTF's deliberately image-row-aligned convention), so no flip
+    // is needed for FBX-sourced materials.
+  }
+  return material;
+}
+
+function ensureSourceMaterial(url, type) {
+  if (!sourceMaterialPromise) {
+    sourceMaterialPromise = extractMaterial(url, type).then(mat => {
+      sourceMaterial = mat;
+      updateTexturedButtonAvailability();
+      return mat;
+    });
+  }
+  return sourceMaterialPromise;
+}
+
+function updateTexturedButtonAvailability() {
+  const btn = document.getElementById('materialTexturedBtn');
+  btn.disabled = !sourceMaterial;
+  btn.title = sourceMaterial ? '' : 'No texture found on the uploaded model.';
+}
+
+// Hovering a piece row pulses that piece's own material (its real color or
+// texture stays visible) with a warm glow, rather than replacing it outright
+// -- a full-material swap reads as "this piece vanished", not "this piece is
+// selected". Pulsing (vs. a static tint) is what makes it read as an
+// indicator overlay rather than a lighting change.
+function setPieceHighlight(idx, on) {
+  const objs = pieceMeshRegistry.get(idx);
+  if (!objs) return;
+  for (const obj of objs) {
+    obj.traverse(c => {
+      if (!c.isMesh || !c.material) return;
+      const mats = Array.isArray(c.material) ? c.material : [c.material];
+      mats.forEach(m => {
+        if (!m || !m.emissive) return;
+        if (on) {
+          if (!('_highlightOrigEmissive' in m.userData)) m.userData._highlightOrigEmissive = m.emissive.clone();
+        } else if ('_highlightOrigEmissive' in m.userData) {
+          m.emissive.copy(m.userData._highlightOrigEmissive);
+          delete m.userData._highlightOrigEmissive;
+        }
+      });
+    });
+  }
+  hoveredPieceIdx = on ? idx : null;
+}
+
+function updateHoverPulse() {
+  if (hoveredPieceIdx === null) return;
+  const objs = pieceMeshRegistry.get(hoveredPieceIdx);
+  if (!objs) return;
+  const pulse = 0.25 + 0.55 * ((Math.sin(performance.now() * 0.006) + 1) / 2);
+  for (const obj of objs) {
+    obj.traverse(c => {
+      if (!c.isMesh || !c.material) return;
+      const mats = Array.isArray(c.material) ? c.material : [c.material];
+      mats.forEach(m => {
+        if (m && m.emissive && '_highlightOrigEmissive' in m.userData) {
+          m.emissive.copy(m.userData._highlightOrigEmissive).lerp(HIGHLIGHT_COLOR, pulse);
+        }
+      });
+    });
+  }
+}
+
+let explodeGroups = null; // Map(pieceIdx -> { group: THREE.Group, dir: THREE.Vector3 })
+let explodeScale = 1;
+let simState = null;
+
+function setUiForMode(mode) {
+  document.getElementById('explodeControl').style.display = mode === 'all' ? 'flex' : 'none';
+  document.getElementById('simInfo').style.display = mode === 'simulate' ? 'block' : 'none';
+}
+
+function applyExplode() {
+  if (!explodeGroups) return;
+  const amount = parseFloat(document.getElementById('explodeSlider').value) * explodeScale;
+  for (const { group, dir } of explodeGroups.values()) {
+    group.position.copy(dir).multiplyScalar(amount);
+  }
+}
+
+// "All pieces (separate)" -- the explode slider (0 = touching/assembled,
+// up to fully scattered) is always available here rather than being a
+// separate layout, since at slider=0 this is visually identical to a plain
+// unexploded piece view anyway.
+async function loadAllPiecesSeparately(pieceUrls) {
+  clearScene();
+  const texts = await Promise.all(pieceUrls.map(u => fetch(u).then(r => r.text())));
+
+  explodeGroups = new Map();
+  const centers = [];
+  texts.forEach((text, idx) => {
+    const parsed = new THREE.OBJLoader().parse(text);
+    parsed.traverse(c => { if (c.isMesh) c.material = pieceMaterial(idx); });
+    const box = new THREE.Box3().setFromObject(parsed);
+    centers[idx] = box.isEmpty() ? new THREE.Vector3() : box.getCenter(new THREE.Vector3());
+    const group = new THREE.Group();
+    group.add(parsed);
+    contentGroup.add(group);
+    explodeGroups.set(idx, { group, dir: new THREE.Vector3(0, 1, 0) });
+    pieceMeshRegistry.set(idx, [group]);
+  });
+
+  const avg = new THREE.Vector3();
+  centers.forEach(c => avg.add(c));
+  if (centers.length) avg.divideScalar(centers.length);
+
+  let maxDist = 0;
+  for (const [idx, entry] of explodeGroups) {
+    const dir = centers[idx].clone().sub(avg);
+    const dist = dir.length();
+    maxDist = Math.max(maxDist, dist);
+    if (dist > 1e-6) entry.dir = dir.normalize();
+  }
+  // Slider is 0..1; scale it so "1" scatters pieces well clear of the model,
+  // regardless of the model's own size.
+  explodeScale = Math.max(maxDist * 3, 0.1);
+
+  applyExplode();
+  frameCameraOnScene();
+  applyUvChecker(document.getElementById('uvChk').checked);
+}
+
+const SNAP_RADIUS = 0.2; // in normalized model space (longest extent == 1.0)
+
+function pieceAbsPosition(pieceIdx) {
+  return simState.centroids.get(pieceIdx).clone().add(simState.groups.get(pieceIdx).position);
+}
+
+function updateSimStatus() {
+  const info = document.getElementById('simInfo');
+  if (!simState) return;
+  const clusterCount = new Set(simState.pieceCluster.values()).size;
+  if (clusterCount <= 1) {
+    info.innerHTML = '<strong style="color:#8ee08e">Puzzle assembled!</strong>';
+  } else {
+    info.textContent = `Drag pieces onto their neighbours to test the fit. ${clusterCount} fragments (of ${simState.totalPieces} pieces) remaining.`;
+  }
+}
+
+function arrangeOnWall() {
+  if (!simState || simState.groups.size === 0) return;
+  const bbox = new THREE.Box3();
+  for (const c of simState.centroids.values()) bbox.expandByPoint(c);
+  const center = bbox.getCenter(new THREE.Vector3());
+  const size = bbox.getSize(new THREE.Vector3());
+  const n = simState.groups.size;
+  const cols = Math.ceil(Math.sqrt(n));
+  const rows = Math.ceil(n / cols);
+
+  const pieceApprox = Math.max(size.x, size.y, 0.01) / Math.max(cols, rows);
+  const cellSize = Math.max(pieceApprox * 4.0, 0.4);
+  const gridHeight = (rows - 1) * cellSize;
+  const minY = center.y - gridHeight / 2;
+  const yOffset = Math.max(0, 0.1 - minY);
+
+  const sortedIndices = Array.from(simState.groups.keys()).sort((a, b) => a - b);
+  sortedIndices.forEach((pieceIdx, i) => {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const offsetX = (col - (cols - 1) / 2) * cellSize;
+    const offsetY = ((rows - 1) / 2 - row) * cellSize;
+    const wallPos = new THREE.Vector3(center.x + offsetX, center.y + offsetY + yOffset, center.z);
+    simState.groups.get(pieceIdx).position.copy(wallPos).sub(simState.centroids.get(pieceIdx));
+  });
+}
+
+function setupSimListeners() {
+  if (!simState) return;
+  const el = renderer.domElement;
+  const raycaster = new THREE.Raycaster();
+  const mouseNDC = new THREE.Vector2();
+  const camDir = new THREE.Vector3();
+  const dragPlane = new THREE.Plane();
+  const planeHit = new THREE.Vector3();
+  const dragOffset = new THREE.Vector3();
+
+  const updateMouseFromEvent = (e) => {
+    const rect = el.getBoundingClientRect();
+    mouseNDC.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    mouseNDC.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  };
+
+  const onPointerDown = (e) => {
+    if (!simState) return;
+    updateMouseFromEvent(e);
+    raycaster.setFromCamera(mouseNDC, camera);
+    const intersects = raycaster.intersectObjects(simState.meshList, false);
+    if (intersects.length === 0) return;
+    const pieceIdx = simState.meshOwner.get(intersects[0].object);
+    const clusterId = simState.pieceCluster.get(pieceIdx);
+    simState.dragging = { clusterId, members: simState.clusterMembers.get(clusterId), refIdx: pieceIdx };
+    controls.enabled = false;
+    camera.getWorldDirection(camDir);
+    const refPos = pieceAbsPosition(pieceIdx);
+    dragPlane.setFromNormalAndCoplanarPoint(camDir, refPos);
+    if (raycaster.ray.intersectPlane(dragPlane, planeHit)) {
+      dragOffset.copy(refPos).sub(planeHit);
+    }
+    e.stopPropagation();
+    e.preventDefault();
+  };
+
+  const onPointerMove = (e) => {
+    if (!simState || !simState.dragging) return;
+    updateMouseFromEvent(e);
+    raycaster.setFromCamera(mouseNDC, camera);
+    if (!raycaster.ray.intersectPlane(dragPlane, planeHit)) return;
+
+    const newRefPos = planeHit.clone().add(dragOffset);
+    const delta = newRefPos.clone().sub(pieceAbsPosition(simState.dragging.refIdx));
+    for (const idx of simState.dragging.members) {
+      simState.groups.get(idx).position.add(delta);
+    }
+
+    let bestDist = Infinity;
+    let bestDelta = new THREE.Vector3();
+    let bestTargetCluster = null;
+    for (const draggedIdx of simState.dragging.members) {
+      const draggedPos = pieceAbsPosition(draggedIdx);
+      for (const [otherIdx, otherClusterId] of simState.pieceCluster) {
+        if (otherClusterId === simState.dragging.clusterId) continue;
+        const relOffset = simState.relOffsets.get(`${draggedIdx}|${otherIdx}`);
+        if (!relOffset) continue;
+        const expectedPos = pieceAbsPosition(otherIdx).add(relOffset);
+        const dist = draggedPos.distanceTo(expectedPos);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestDelta.copy(expectedPos).sub(draggedPos);
+          bestTargetCluster = otherClusterId;
+        }
+      }
+    }
+
+    if (bestDist < SNAP_RADIUS && bestTargetCluster !== null) {
+      for (const idx of simState.dragging.members) {
+        simState.groups.get(idx).position.add(bestDelta);
+      }
+      const targetMembers = simState.clusterMembers.get(bestTargetCluster);
+      for (const idx of simState.dragging.members) {
+        targetMembers.add(idx);
+        simState.pieceCluster.set(idx, bestTargetCluster);
+      }
+      simState.clusterMembers.delete(simState.dragging.clusterId);
+      simState.dragging = null;
+      controls.enabled = true;
+      updateSimStatus();
+    }
+    e.stopPropagation();
+    e.preventDefault();
+  };
+
+  const onPointerUp = (e) => {
+    if (simState && simState.dragging) {
+      simState.dragging = null;
+      controls.enabled = true;
+      e.stopPropagation();
+      e.preventDefault();
+    }
+  };
+
+  el.addEventListener('pointerdown', onPointerDown, { capture: true });
+  el.addEventListener('pointermove', onPointerMove, { capture: true });
+  el.addEventListener('pointerup', onPointerUp, { capture: true });
+
+  simState.cleanupListeners = () => {
+    el.removeEventListener('pointerdown', onPointerDown, { capture: true });
+    el.removeEventListener('pointermove', onPointerMove, { capture: true });
+    el.removeEventListener('pointerup', onPointerUp, { capture: true });
+  };
+}
+
+async function loadSimulate(pieceUrls, checkpointUrl) {
+  clearScene();
+  const infoEl = document.getElementById('simInfo');
+  infoEl.textContent = 'Loading...';
+
+  // Geometry comes from the same per-piece OBJs as All pieces/Exploded
+  // (rather than pieces.glb) so materialMode (colored/textured) applies
+  // here the same way. The assembled-space placement/adjacency math is
+  // independent of the geometry source -- it comes entirely from
+  // checkpoint.json's piece_centroids/adjacency either way.
+  const [texts, checkpoint] = await Promise.all([
+    Promise.all(pieceUrls.map(u => fetch(u).then(r => r.text()))),
+    fetch(checkpointUrl).then(r => r.json()),
+  ]);
+
+  const groups = new Map();
+  const meshOwner = new Map();
+  const meshList = [];
+  texts.forEach((text, idx) => {
+    const parsed = new THREE.OBJLoader().parse(text);
+    const g = new THREE.Group();
+    parsed.traverse(c => {
+      if (!c.isMesh) return;
+      c.material = pieceMaterial(idx);
+      meshOwner.set(c, idx);
+      meshList.push(c);
+    });
+    g.add(parsed);
+    contentGroup.add(g);
+    groups.set(idx, g);
+    pieceMeshRegistry.set(idx, [g]);
+  });
+
+  const centroids = new Map();
+  checkpoint.piece_centroids.forEach((c, idx) => {
+    centroids.set(idx, new THREE.Vector3(c[0], c[1], c[2]));
+  });
+
+  const relOffsets = new Map();
+  for (const edge of checkpoint.adjacency) {
+    relOffsets.set(`${edge.piece_a}|${edge.piece_b}`, new THREE.Vector3(edge.offset[0], edge.offset[1], edge.offset[2]));
+  }
+
+  const clusterMembers = new Map();
+  const pieceCluster = new Map();
+  for (const idx of groups.keys()) {
+    clusterMembers.set(idx, new Set([idx]));
+    pieceCluster.set(idx, idx);
+  }
+
+  simState = {
+    groups, meshOwner, meshList, centroids, relOffsets,
+    clusterMembers, pieceCluster, totalPieces: groups.size,
+    dragging: null, cleanupListeners: null,
+  };
+
+  arrangeOnWall();
+  setupSimListeners();
+  frameCameraOnScene();
+  updateSimStatus();
+  applyWireframe();
+}
+
 function clearScene() {
+  if (simState) {
+    simState.cleanupListeners?.();
+    simState = null;
+  }
+  explodeGroups = null;
+  pieceMeshRegistry = new Map();
+  hoveredPieceIdx = null;
+  controls.enabled = true;
   for (let i = contentGroup.children.length - 1; i >= 0; i--) {
     const obj = contentGroup.children[i];
     obj.traverse(c => {
@@ -220,7 +704,19 @@ function clearScene() {
   }
 }
 
-function frameCameraOnScene() {
+document.getElementById('explodeSlider').addEventListener('input', applyExplode);
+
+// Layouts call this unconditionally after loading, but we only actually
+// want to move the camera the first time a given model is shown -- once
+// framed, switching between Layout buttons (Combined <-> All pieces <->
+// Test construction, etc.) should keep the user's current pan/zoom/rotate,
+// not snap back to a default view every click. previewLocalFile and a
+// fresh slice result reset cameraHasBeenFramed since those really are a
+// new model; "Reset view" passes force=true to bypass the guard on demand.
+let cameraHasBeenFramed = false;
+
+function frameCameraOnScene(force) {
+  if (cameraHasBeenFramed && !force) return;
   const box = new THREE.Box3().setFromObject(contentGroup);
   if (box.isEmpty()) return;
   const size = new THREE.Vector3();
@@ -237,6 +733,7 @@ function frameCameraOnScene() {
   camera.updateProjectionMatrix();
   camera.position.copy(center).add(new THREE.Vector3(fitDist, fitDist * 0.6, fitDist));
   controls.update();
+  cameraHasBeenFramed = true;
 }
 
 async function loadPreview(objUrl, mtlUrl) {
@@ -254,6 +751,15 @@ async function loadPreview(objUrl, mtlUrl) {
   const group = objLoader.parse(objText);
   group.traverse(c => { if (c.isMesh) c.material.side = THREE.DoubleSide; });
   contentGroup.add(group);
+
+  // preview.obj groups faces into one named "piece_<i>" object per region
+  // (see stage10.write_preview_obj) -- register each so the piece list's
+  // hover highlight works on the Combined view too.
+  group.children.forEach(child => {
+    const m = child.name.match(/^piece_(\d+)$/);
+    if (m) pieceMeshRegistry.set(parseInt(m[1], 10), [child]);
+  });
+
   frameCameraOnScene();
   applyUvChecker(document.getElementById('uvChk').checked);
 }
@@ -287,37 +793,55 @@ async function loadSourcePreview(url, type) {
     if (!c.isMesh) return;
     if (!c.material) c.material = new THREE.MeshStandardMaterial({ color: 0x9099a6, roughness: 0.8 });
     const mats = Array.isArray(c.material) ? c.material : [c.material];
-    mats.forEach(m => { m.side = THREE.DoubleSide; });
+    mats.forEach(m => {
+      m.side = THREE.DoubleSide;
+      // Loaders don't consistently flag color/base-color maps as sRGB --
+      // force it so the renderer's sRGB output conversion (see renderer
+      // setup above) actually corrects them.
+      if (m.map) m.map.encoding = THREE.sRGBEncoding;
+    });
   });
   contentGroup.add(group);
   frameCameraOnScene();
   applyUvChecker(document.getElementById('uvChk').checked);
 }
 
-async function loadAllPiecesSeparately(pieceUrls) {
-  clearScene();
-  const texts = await Promise.all(pieceUrls.map(u => fetch(u).then(r => r.text())));
-  texts.forEach((text, idx) => {
-    const group = new THREE.OBJLoader().parse(text);
-    const color = hsvColor(idx * GOLDEN_RATIO_CONJUGATE);
-    group.traverse(c => {
-      if (c.isMesh) c.material = new THREE.MeshStandardMaterial({ color, side: THREE.DoubleSide, roughness: 0.7 });
-    });
-    contentGroup.add(group);
-  });
-  frameCameraOnScene();
-  applyUvChecker(document.getElementById('uvChk').checked);
+let localPreviewUrl = null;
+
+// Preview the just-picked file immediately, before any upload/slice happens
+// -- reads it straight off disk via a blob: URL through the same
+// format-native loaders "Original model" uses.
+async function previewLocalFile(file) {
+  stopPolling();
+  lastResult = null;
+  cameraHasBeenFramed = false;
+  resultsBlock.style.display = 'none';
+  setUiForMode(null);
+  sliceBtn.disabled = false;
+  setStatus(`Previewing ${file.name} -- click Slice to process.`);
+
+  if (localPreviewUrl) URL.revokeObjectURL(localPreviewUrl);
+  localPreviewUrl = URL.createObjectURL(file);
+  const ext = file.name.split('.').pop().toLowerCase();
+  const type = ext === 'glb' ? 'glb' : ext === 'fbx' ? 'fbx' : 'obj';
+  try {
+    await loadSourcePreview(localPreviewUrl, type);
+  } catch (err) {
+    setStatus(`Could not preview ${file.name}: ${err}`, true);
+  }
 }
+
+document.getElementById('modelFile').addEventListener('change', (e) => {
+  if (e.target.files.length) previewLocalFile(e.target.files[0]);
+});
 
 async function loadSinglePiece(pieceUrl, idx) {
   clearScene();
   const text = await fetch(pieceUrl).then(r => r.text());
   const group = new THREE.OBJLoader().parse(text);
-  const color = hsvColor(idx * GOLDEN_RATIO_CONJUGATE);
-  group.traverse(c => {
-    if (c.isMesh) c.material = new THREE.MeshStandardMaterial({ color, side: THREE.DoubleSide, roughness: 0.7 });
-  });
+  group.traverse(c => { if (c.isMesh) c.material = pieceMaterial(idx); });
   contentGroup.add(group);
+  pieceMeshRegistry.set(idx, [group]);
   frameCameraOnScene();
   applyUvChecker(document.getElementById('uvChk').checked);
 }
@@ -337,7 +861,7 @@ document.getElementById('uvChk').addEventListener('change', (e) => applyUvChecke
 document.getElementById('bgChk').addEventListener('change', (e) => {
   scene.background = new THREE.Color(e.target.checked ? LIGHT_BG : DARK_BG);
 });
-document.getElementById('resetViewBtn').addEventListener('click', frameCameraOnScene);
+document.getElementById('resetViewBtn').addEventListener('click', () => frameCameraOnScene(true));
 
 // ---------------------------------------------------------------------
 // Upload / slice / results UI.
@@ -347,20 +871,68 @@ const statusMsg = document.getElementById('statusMsg');
 const sliceBtn = document.getElementById('sliceBtn');
 const resultsBlock = document.getElementById('resultsBlock');
 const summary = document.getElementById('summary');
-const viewToggle = document.getElementById('viewToggle');
+const layoutToggle = document.getElementById('layoutToggle');
+const materialToggle = document.getElementById('materialToggle');
 const piecesTable = document.getElementById('piecesTable');
 
 let lastResult = null;
+let activeLayoutKey = null;
 
 function setStatus(msg, isError) {
   statusMsg.textContent = msg;
   statusMsg.className = isError ? 'error' : '';
 }
 
-function setActiveToggle(button) {
-  viewToggle.querySelectorAll('button').forEach(b => b.classList.remove('active'));
-  if (button) button.classList.add('active');
+// Layout (Combined / Original model / All pieces / Test construction) and
+// Material (Colored / Textured) are independent axes -- Material only makes
+// sense for the two per-piece layouts, since Combined is always the flat
+// per-region preview and Original model always shows whatever the upload
+// actually has.
+const PIECE_LAYOUTS = new Set(['all', 'simulate']);
+
+function renderCurrentLayout() {
+  if (!lastResult || !activeLayoutKey) return;
+  const data = lastResult;
+  if (activeLayoutKey === 'combined') loadPreview(data.preview_obj, data.preview_mtl);
+  else if (activeLayoutKey === 'original') loadSourcePreview(data.source_url, data.source_type);
+  else if (activeLayoutKey === 'all') loadAllPiecesSeparately(data.piece_urls);
+  else if (activeLayoutKey === 'simulate') loadSimulate(data.piece_urls, data.checkpoint_json);
 }
+
+// Camera framing is intentionally NOT re-triggered here -- switching Layout
+// keeps whatever pan/zoom/rotate the user left the camera at (see
+// frameCameraOnScene's cameraHasBeenFramed guard). Only a genuinely new
+// model (previewLocalFile, a fresh slice result) or an explicit "Reset
+// view" click re-frames.
+function selectLayout(key) {
+  if (!lastResult) return;
+  activeLayoutKey = key;
+  layoutToggle.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.layout === key));
+  const showMaterial = PIECE_LAYOUTS.has(key);
+  document.getElementById('materialHeading').style.display = showMaterial ? 'block' : 'none';
+  materialToggle.style.display = showMaterial ? 'flex' : 'none';
+  setUiForMode(key);
+  renderCurrentLayout();
+}
+
+layoutToggle.querySelectorAll('button').forEach(btn => {
+  btn.addEventListener('click', () => selectLayout(btn.dataset.layout));
+});
+
+function updateMaterialButtonsActive() {
+  document.getElementById('materialColoredBtn').classList.toggle('active', materialMode === 'colored');
+  document.getElementById('materialTexturedBtn').classList.toggle('active', materialMode === 'textured');
+}
+
+async function setMaterialMode(mode) {
+  materialMode = mode;
+  updateMaterialButtonsActive();
+  if (mode === 'textured' && lastResult) await ensureSourceMaterial(lastResult.source_url, lastResult.source_type);
+  renderCurrentLayout();
+}
+
+document.getElementById('materialColoredBtn').addEventListener('click', () => setMaterialMode('colored'));
+document.getElementById('materialTexturedBtn').addEventListener('click', () => setMaterialMode('textured'));
 
 let pollTimer = null;
 
@@ -381,6 +953,7 @@ form.addEventListener('submit', async (e) => {
   stopPolling();
   sliceBtn.disabled = true;
   resultsBlock.style.display = 'none';
+  setUiForMode(null);
   setStatus(`Uploading ${fileInput.files[0].name}...`);
 
   const fd = new FormData();
@@ -455,39 +1028,24 @@ function renderResult(data) {
     </table>
   `;
 
-  viewToggle.innerHTML = '';
-  const combinedBtn = document.createElement('button');
-  combinedBtn.type = 'button';
-  combinedBtn.textContent = 'Combined (colored)';
-  combinedBtn.addEventListener('click', () => {
-    setActiveToggle(combinedBtn);
-    loadPreview(data.preview_obj, data.preview_mtl);
-  });
-  viewToggle.appendChild(combinedBtn);
-
-  const sourceBtn = document.createElement('button');
-  sourceBtn.type = 'button';
-  sourceBtn.textContent = 'Original texture';
-  sourceBtn.addEventListener('click', () => {
-    setActiveToggle(sourceBtn);
-    loadSourcePreview(data.source_url, data.source_type);
-  });
-  viewToggle.appendChild(sourceBtn);
-
-  const allBtn = document.createElement('button');
-  allBtn.type = 'button';
-  allBtn.textContent = 'All pieces (separate)';
-  allBtn.addEventListener('click', () => {
-    setActiveToggle(allBtn);
-    loadAllPiecesSeparately(data.piece_urls);
-  });
-  viewToggle.appendChild(allBtn);
+  // Fresh model -- drop any material extracted for the previous one and
+  // reset to the default (always-available) coloring, reset the explode
+  // amount, and let the camera auto-frame again for this new content.
+  materialMode = 'colored';
+  sourceMaterial = null;
+  sourceMaterialPromise = null;
+  updateMaterialButtonsActive();
+  ensureSourceMaterial(data.source_url, data.source_type);
+  document.getElementById('explodeSlider').value = '0';
+  cameraHasBeenFramed = false;
 
   piecesTable.innerHTML = '';
   data.pieces.forEach((p) => {
     const tr = document.createElement('tr');
     const devPct = (p.deviation * 100).toFixed(1);
+    const swatchColor = '#' + hsvColor(p.index * GOLDEN_RATIO_CONJUGATE).getHexString();
     tr.innerHTML = `
+      <td><span class="swatch" style="background:${swatchColor}"></span></td>
       <td><a href="#" class="dl" data-idx="${p.index}">${p.index}</a></td>
       <td>${p.faces}</td>
       <td>${devPct > 0 ? '+' : ''}${devPct}%</td>
@@ -495,14 +1053,19 @@ function renderResult(data) {
     `;
     tr.querySelector('a[data-idx]').addEventListener('click', (e) => {
       e.preventDefault();
-      setActiveToggle(null);
+      activeLayoutKey = null;
+      layoutToggle.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+      document.getElementById('materialHeading').style.display = 'none';
+      materialToggle.style.display = 'none';
+      setUiForMode(null);
       loadSinglePiece(data.piece_urls[p.index], p.index);
     });
+    tr.addEventListener('mouseenter', () => setPieceHighlight(p.index, true));
+    tr.addEventListener('mouseleave', () => setPieceHighlight(p.index, false));
     piecesTable.appendChild(tr);
   });
 
-  setActiveToggle(combinedBtn);
-  loadPreview(data.preview_obj, data.preview_mtl);
+  selectLayout('combined');
 }
 </script>
 </body>
