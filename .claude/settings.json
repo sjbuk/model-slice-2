@@ -128,7 +128,8 @@
       "Bash(netstat -ano)",
       "Bash(taskkill //F //PID 30236 //T)",
       "Bash(curl -s http://localhost:5000/ -o /dev/null -w \"status: %{http_code}\\\\n\")",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(python -m pytest tests/test_stage6.py tests/test_stage7.py tests/test_stage8.py tests/test_progress.py -v)"
     ],
     "additionalDirectories": [
       "D:\\Unity\\JigSaw2\\models"
