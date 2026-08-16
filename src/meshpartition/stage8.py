@@ -7,12 +7,12 @@
 
 A region's "medoid" is the face minimizing the sum of dual-graph distances to
 every other face currently carrying that region's label -- the graph analogue
-of a geometric medoid, computed exactly (all-pairs within the region) since
-fixture-scale regions are small. This is done over the region's *current*
-label, not its originating major component: after Stage 7 a region's
-footprint can include adopted satellite cells and dumped-in cells from
-elsewhere, all reachable only through the full dual graph (surface + bridge
-edges).
+of a geometric medoid, computed exactly (all-pairs within the region) at
+fixture scale; see _medoid's own docstring-comment for the approximation used
+past _EXACT_MEDOID_MAX_FACES. This is done over the region's *current* label,
+not its originating major component: after Stage 7 a region's footprint can
+include adopted satellite cells and dumped-in cells from elsewhere, all
+reachable only through the full dual graph (surface + bridge edges).
 
 Re-seeding keeps the same region id -> its new medoid face, preserving
 region identity across iterations (needed for both the score history and for
@@ -141,14 +141,46 @@ def _region_csr(adjacency: dict[int, list[tuple[int, float]]]) -> tuple[csr_matr
     return csr, faces
 
 
+# Exact all-pairs Dijkstra (scipy's dijkstra() with no `indices`) materializes
+# a dense n x n distance matrix -- fine at "fixture-scale" (the original
+# design target) but a real hard-surface asset can leave a region with tens
+# of thousands of faces (e.g. force_exact_count on a mesh with hundreds of
+# disconnected detail parts and few majors), where that matrix alone is
+# gigabytes and the O(n * (E+n) log n) time to fill it is minutes, every
+# relaxation iteration. Past this many faces, approximate instead.
+_EXACT_MEDOID_MAX_FACES = 1500
+# Each candidate is scored by one single-source Dijkstra (its true, exact sum
+# of distances to the rest of the region -- O(n) memory, since it's one row,
+# not the whole matrix), so this bounds the approximation to a fixed number
+# of exact evaluations rather than evaluating every face as a candidate.
+_APPROX_MEDOID_SAMPLE_SIZE = 200
+
+
 def _medoid(adjacency: dict[int, list[tuple[int, float]]]) -> int:
     csr, faces = _region_csr(adjacency)
-    # adjacency already carries both directions of every edge (see build_dual_graph),
-    # so directed=True over those explicit reciprocal entries gives correct
-    # undirected distances without scipy needing to symmetrize the matrix itself.
-    distances = dijkstra(csr, directed=True)
-    totals = distances.sum(axis=1)
-    return faces[int(np.argmin(totals))]
+    n = len(faces)
+
+    if n <= _EXACT_MEDOID_MAX_FACES:
+        # adjacency already carries both directions of every edge (see build_dual_graph),
+        # so directed=True over those explicit reciprocal entries gives correct
+        # undirected distances without scipy needing to symmetrize the matrix itself.
+        distances = dijkstra(csr, directed=True)
+        totals = distances.sum(axis=1)
+        return faces[int(np.argmin(totals))]
+
+    # Deterministic, evenly-spaced sample of candidates rather than every
+    # face -- Lloyd relaxation only needs a reasonable re-seed point each
+    # pass, not the true minimum over all n, and the loop self-corrects
+    # over iterations regardless.
+    stride = max(1, n // _APPROX_MEDOID_SAMPLE_SIZE)
+    best_face = faces[0]
+    best_total = np.inf
+    for idx in range(0, n, stride):
+        total = float(dijkstra(csr, directed=True, indices=idx).sum())
+        if total < best_total:
+            best_total = total
+            best_face = faces[idx]
+    return best_face
 
 
 def _reseed(seed_result: SeedResult, new_seed_faces: list[int]) -> SeedResult:

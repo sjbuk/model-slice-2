@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+from numba import njit, prange
 
 
 class UnionFind:
@@ -67,71 +68,82 @@ def face_normals(corner_positions: np.ndarray) -> np.ndarray:
     return cross / lengths
 
 
-def closest_points_on_triangles(
-    p: np.ndarray, a: np.ndarray, b: np.ndarray, c: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Closest point (and distance) from p to each of T triangles (a[i],b[i],c[i]).
+@njit(cache=True, parallel=True)
+def closest_point_distance_matrix(
+    query: np.ndarray, a: np.ndarray, b: np.ndarray, c: np.ndarray
+) -> np.ndarray:
+    """(S,3) query points x (T,3)/(T,3)/(T,3) triangle corners -> (S, T)
+    closest-point distances.
 
-    Standard region-based algorithm (Ericson, "Real-Time Collision Detection",
-    5.1.5), vectorized over all T triangles at once.
+    Standard region-based algorithm (Ericson, "Real-Time Collision
+    Detection", 5.1.5), one query/triangle pair at a time. This used to be
+    vectorized through numpy instead of compiled, which allocates ~15-20
+    T-length temporary arrays per call; once S and T are both in the
+    thousands (a real hard-surface asset's bridge search can have S*T in
+    the tens of millions per satellite), that allocation traffic dominates
+    over the actual arithmetic. A compiled scalar loop needs none of it --
+    just the (S, T) output -- and parallelizes over query points.
     """
-    ab = b - a
-    ac = c - a
-    ap = p - a
-    d1 = np.einsum("ij,ij->i", ab, ap)
-    d2 = np.einsum("ij,ij->i", ac, ap)
+    s = query.shape[0]
+    t = a.shape[0]
+    dists = np.empty((s, t), dtype=np.float64)
+    for si in prange(s):
+        px = query[si, 0]
+        py = query[si, 1]
+        pz = query[si, 2]
+        for ti in range(t):
+            ax, ay, az = a[ti, 0], a[ti, 1], a[ti, 2]
+            bx, by, bz = b[ti, 0], b[ti, 1], b[ti, 2]
+            cx, cy, cz = c[ti, 0], c[ti, 1], c[ti, 2]
 
-    t = len(a)
-    result = np.empty((t, 3), dtype=np.float64)
-    unresolved = np.ones(t, dtype=bool)
+            abx, aby, abz = bx - ax, by - ay, bz - az
+            acx, acy, acz = cx - ax, cy - ay, cz - az
+            apx, apy, apz = px - ax, py - ay, pz - az
+            d1 = abx * apx + aby * apy + abz * apz
+            d2 = acx * apx + acy * apy + acz * apz
 
-    mask = (d1 <= 0) & (d2 <= 0) & unresolved
-    result[mask] = a[mask]
-    unresolved &= ~mask
+            if d1 <= 0.0 and d2 <= 0.0:
+                rx, ry, rz = ax, ay, az
+            else:
+                bpx, bpy, bpz = px - bx, py - by, pz - bz
+                d3 = abx * bpx + aby * bpy + abz * bpz
+                d4 = acx * bpx + acy * bpy + acz * bpz
+                if d3 >= 0.0 and d4 <= d3:
+                    rx, ry, rz = bx, by, bz
+                else:
+                    vc = d1 * d4 - d3 * d2
+                    if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+                        v = d1 / (d1 - d3)
+                        rx, ry, rz = ax + abx * v, ay + aby * v, az + abz * v
+                    else:
+                        cpx, cpy, cpz = px - cx, py - cy, pz - cz
+                        d5 = abx * cpx + aby * cpy + abz * cpz
+                        d6 = acx * cpx + acy * cpy + acz * cpz
+                        if d6 >= 0.0 and d5 <= d6:
+                            rx, ry, rz = cx, cy, cz
+                        else:
+                            vb = d5 * d2 - d1 * d6
+                            if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+                                w = d2 / (d2 - d6)
+                                rx, ry, rz = ax + acx * w, ay + acy * w, az + acz * w
+                            else:
+                                va = d3 * d6 - d5 * d4
+                                if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
+                                    w_bc = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+                                    rx = bx + (cx - bx) * w_bc
+                                    ry = by + (cy - by) * w_bc
+                                    rz = bz + (cz - bz) * w_bc
+                                else:
+                                    denom = va + vb + vc
+                                    v = vb / denom
+                                    w = vc / denom
+                                    rx = ax + abx * v + acx * w
+                                    ry = ay + aby * v + acy * w
+                                    rz = az + abz * v + acz * w
 
-    bp = p - b
-    d3 = np.einsum("ij,ij->i", ab, bp)
-    d4 = np.einsum("ij,ij->i", ac, bp)
-    mask = (d3 >= 0) & (d4 <= d3) & unresolved
-    result[mask] = b[mask]
-    unresolved &= ~mask
-
-    vc = d1 * d4 - d3 * d2
-    mask = (vc <= 0) & (d1 >= 0) & (d3 <= 0) & unresolved
-    denom = np.where(mask, d1 - d3, 1.0)
-    v = np.where(mask, d1 / denom, 0.0)
-    result[mask] = (a + ab * v[:, None])[mask]
-    unresolved &= ~mask
-
-    cp = p - c
-    d5 = np.einsum("ij,ij->i", ab, cp)
-    d6 = np.einsum("ij,ij->i", ac, cp)
-    mask = (d6 >= 0) & (d5 <= d6) & unresolved
-    result[mask] = c[mask]
-    unresolved &= ~mask
-
-    vb = d5 * d2 - d1 * d6
-    mask = (vb <= 0) & (d2 >= 0) & (d6 <= 0) & unresolved
-    denom = np.where(mask, d2 - d6, 1.0)
-    w = np.where(mask, d2 / denom, 0.0)
-    result[mask] = (a + ac * w[:, None])[mask]
-    unresolved &= ~mask
-
-    va = d3 * d6 - d5 * d4
-    mask = (va <= 0) & ((d4 - d3) >= 0) & ((d5 - d6) >= 0) & unresolved
-    bc_denom = np.where(mask, (d4 - d3) + (d5 - d6), 1.0)
-    w_bc = np.where(mask, (d4 - d3) / bc_denom, 0.0)
-    result[mask] = (b + (c - b) * w_bc[:, None])[mask]
-    unresolved &= ~mask
-
-    # Remaining: interior of the face.
-    denom = np.where(unresolved, va + vb + vc, 1.0)
-    v = np.where(unresolved, vb / denom, 0.0)
-    w = np.where(unresolved, vc / denom, 0.0)
-    result[unresolved] = (a + ab * v[:, None] + ac * w[:, None])[unresolved]
-
-    dists = np.linalg.norm(result - p, axis=1)
-    return result, dists
+            dx, dy, dz = rx - px, ry - py, rz - pz
+            dists[si, ti] = (dx * dx + dy * dy + dz * dz) ** 0.5
+    return dists
 
 
 def generalized_winding_number(p: np.ndarray, positions: np.ndarray, faces: np.ndarray) -> float:

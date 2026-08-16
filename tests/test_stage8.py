@@ -11,7 +11,7 @@ from meshpartition.stage4 import build_dual_graph
 from meshpartition.stage5 import seed
 from meshpartition.stage6 import grow
 from meshpartition.stage7 import repair
-from meshpartition.stage8 import DEFAULT_EPSILON_BAL, relax
+from meshpartition.stage8 import DEFAULT_EPSILON_BAL, _EXACT_MEDOID_MAX_FACES, _medoid, relax
 
 from fixtures import fixture_a_sphere, fixture_e_ribbon
 
@@ -58,6 +58,34 @@ def test_8_2_best_retained():
     assert len(relaxed.scores) == relaxed.iterations_run == 3
     assert relaxed.score == min(relaxed.scores)
     assert relaxed.score != relaxed.scores[-1]  # final iteration was worse than the best
+
+
+def test_8_4_large_region_medoid_stays_bounded():
+    """Regression test for the web UI near-OOM on CarConcept.glb: exact
+    all-pairs Dijkstra materializes a dense n x n distance matrix, which is
+    fine at fixture scale but gigabytes for a real hard-surface asset's
+    large regions (a force_exact_count run left a 20k+-face region, and the
+    dense matrix alone approached the container's memory limit).
+
+    A region past _EXACT_MEDOID_MAX_FACES faces must fall back to the
+    sampled-candidate approximation instead of ever building that matrix,
+    and still return a face that is actually part of the region. Modeled as
+    a plain path graph (node i <-> i+1, cost 1) so the true medoid is known
+    (the middle node minimizes total distance along a chain) and the
+    approximation's result can be checked for being in the right
+    neighborhood, not just "didn't crash".
+    """
+    n = _EXACT_MEDOID_MAX_FACES + 500
+    adjacency = {i: [] for i in range(n)}
+    for i in range(n - 1):
+        adjacency[i].append((i + 1, 1.0))
+        adjacency[i + 1].append((i, 1.0))
+
+    medoid = _medoid(adjacency)
+
+    assert medoid in adjacency
+    true_middle = n // 2
+    assert abs(medoid - true_middle) < n // 10  # approximate, but in the right neighborhood
 
 
 def test_8_3_termination_limits():

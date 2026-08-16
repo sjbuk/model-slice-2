@@ -424,7 +424,7 @@ function pollJob(jobId) {
     }
 
     if (data.status === 'running') {
-      setStatus(`Slicing... ${data.elapsed_seconds}s elapsed. Multi-pass relaxation on real-world meshes can take a while (see the Stage 8 note in the project README) -- this will time out on its own after a few minutes if it's stuck.`);
+      setStatus(`Slicing... ${data.elapsed_seconds}s elapsed. Multi-pass relaxation on real-world meshes can take a while (see the Stage 8 note in the project README) -- this will be stopped automatically after 10 minutes if it's stuck.`);
       return;
     }
 

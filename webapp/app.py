@@ -25,6 +25,13 @@ OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {".fbx", ".obj", ".glb"}
 
+# Hard cutoff for a slicing job. Stage 8's relaxation re-seeding can run long
+# on inputs that don't converge in a single pass (see worker.py), and Stage 2's
+# bridge search scales with satellite/major face counts on messy real-world
+# assets -- past this, a job is presumed stuck rather than left running (and
+# polled) forever.
+JOB_TIME_BUDGET_SECONDS = 600
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB uploads
 
@@ -129,6 +136,14 @@ def job_status(job_id):
     elapsed = time.monotonic() - job["started"]
 
     if proc.poll() is None:
+        if elapsed > JOB_TIME_BUDGET_SECONDS:
+            proc.kill()
+            proc.wait()
+            job["response"] = {
+                "status": "error",
+                "error": f"Slicing timed out after {JOB_TIME_BUDGET_SECONDS}s and was stopped.",
+            }
+            return jsonify(job["response"])
         return jsonify(status="running", elapsed_seconds=round(elapsed, 1))
 
     result_path = job["job_dir"] / "result.json"
