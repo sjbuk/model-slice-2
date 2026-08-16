@@ -27,13 +27,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from numba import njit
 
 from .mesh import WorkingMesh
 from .stage1 import TriageResult
 from .stage2 import BridgeResult
 from .stage4 import DualGraph
 from .stage6 import DEFAULT_ALPHA, GrowthResult
-from .util import UnionFind
+from .util import dual_graph_csr
 
 DEFAULT_GAMMA = 2.5
 ELONGATION_ALPHA_STEP = 0.5
@@ -56,22 +57,66 @@ def _label_areas(working: WorkingMesh, label: np.ndarray, n_regions: int) -> np.
     return areas
 
 
+@njit(cache=True, inline="always")
+def _uf_find(parent: np.ndarray, x: int) -> int:
+    root = x
+    while parent[root] != root:
+        root = parent[root]
+    while parent[x] != root:
+        parent[x], x = root, parent[x]
+    return root
+
+
+@njit(cache=True, inline="always")
+def _uf_union(parent: np.ndarray, a: int, b: int) -> None:
+    ra = _uf_find(parent, a)
+    rb = _uf_find(parent, b)
+    if ra == rb:
+        return
+    # Deterministic, matching util.UnionFind: the smaller root index always
+    # wins, so the resulting partition doesn't depend on edge-scan order.
+    if ra < rb:
+        parent[rb] = ra
+    else:
+        parent[ra] = rb
+
+
+@njit(cache=True)
+def _label_components_kernel(indptr: np.ndarray, nbr: np.ndarray, label: np.ndarray) -> np.ndarray:
+    n = label.shape[0]
+    parent = np.arange(n, dtype=np.int64)
+    for face_id in range(n):
+        for e in range(indptr[face_id], indptr[face_id + 1]):
+            neighbor = nbr[e]
+            if label[face_id] == label[neighbor]:
+                _uf_union(parent, face_id, neighbor)
+
+    roots = np.empty(n, dtype=np.int64)
+    for face_id in range(n):
+        roots[face_id] = _uf_find(parent, face_id)
+    return roots
+
+
 def label_components(
     working: WorkingMesh, dual_graph: DualGraph, label: np.ndarray
 ) -> dict[int, dict[int, list[int]]]:
     """Connected components of each label, under same-label adjacency in the
     full dual graph (including bridges). Returns label -> root -> face ids.
+
+    The edge-scan + union-find pass is a numba kernel (own array-based
+    union-find, not util.UnionFind -- that class is also used by Stage
+    0/Stage 1 and this keeps their behavior untouched) over a cached CSR
+    view of dual_graph.adjacency (see util.dual_graph_csr): this function is
+    re-run by Stage 8's relax() on every Lloyd iteration, so the same
+    per-run CSR cache that grow() uses applies here too.
     """
-    uf = UnionFind(working.face_count)
-    for face_id, entries in dual_graph.adjacency.items():
-        for neighbor, _cost, _is_bridge in entries:
-            if label[face_id] == label[neighbor]:
-                uf.union(face_id, neighbor)
+    indptr, nbr, _cost = dual_graph_csr(dual_graph)
+    roots = _label_components_kernel(indptr, nbr, np.ascontiguousarray(label, dtype=np.int64))
 
     groups: dict[int, dict[int, list[int]]] = {}
     for face_id in range(working.face_count):
         lbl = int(label[face_id])
-        root = uf.find(face_id)
+        root = int(roots[face_id])
         groups.setdefault(lbl, {}).setdefault(root, []).append(face_id)
     return groups
 

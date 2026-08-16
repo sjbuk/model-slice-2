@@ -146,6 +146,46 @@ def closest_point_distance_matrix(
     return dists
 
 
+def dual_graph_csr(dual_graph) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """CSR view (indptr, neighbor_face_ids, edge_costs) of a DualGraph's
+    dict-of-lists adjacency, for numba kernels that need array-based
+    traversal.
+
+    Built once and cached on the DualGraph instance itself (a plain,
+    unslotted dataclass, so this attribute attach is safe without touching
+    stage4.py) -- relax()'s Lloyd loop calls grow()/repair() against the
+    *same* DualGraph object up to i_max times, so paying this dict->array
+    conversion once per pipeline run rather than once per call matters
+    almost as much as the compiled kernels that consume it. is_bridge is
+    dropped: neither grow() nor label_components() branches on it, only
+    neighbor id and edge cost.
+    """
+    cached = getattr(dual_graph, "_csr_cache", None)
+    if cached is not None:
+        return cached
+
+    adjacency = dual_graph.adjacency
+    n = len(adjacency)
+    indptr = np.zeros(n + 1, dtype=np.int64)
+    for i in range(n):
+        indptr[i + 1] = indptr[i] + len(adjacency[i])
+
+    total = int(indptr[-1])
+    nbr = np.empty(total, dtype=np.int64)
+    cost = np.empty(total, dtype=np.float64)
+    pos = indptr[:-1].copy()
+    for i in range(n):
+        for neighbor, edge_cost, _is_bridge in adjacency[i]:
+            p = pos[i]
+            nbr[p] = neighbor
+            cost[p] = edge_cost
+            pos[i] += 1
+
+    result = (indptr, nbr, cost)
+    dual_graph._csr_cache = result
+    return result
+
+
 def generalized_winding_number(p: np.ndarray, positions: np.ndarray, faces: np.ndarray) -> float:
     """Generalized winding number of p w.r.t. the (possibly non-watertight)
     mesh (positions, faces). ~1 fully enclosed, ~0 fully outside, fractional
