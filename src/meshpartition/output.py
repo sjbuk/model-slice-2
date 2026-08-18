@@ -13,6 +13,7 @@ from __future__ import annotations
 import colorsys
 import json
 import math
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -189,40 +190,163 @@ def write_checkpoint(
     out_path.write_text(json.dumps(payload, indent=2))
 
 
+def _simplify_pymeshlab(mesh: trimesh.Trimesh, target_faces: int) -> trimesh.Trimesh:
+    """Decimate via PyMeshLab quadric edge collapse.
+
+    ``preserveboundary=True`` (the default) blocks boundary-edge collapses
+    that would otherwise open holes -- unlike trimesh's
+    ``simplify_quadric_decimation`` (a thin wrapper around
+    ``fast_simplification``), which has no such safeguard and was tearing
+    open welded piece-seam vertices under heavy decimation.
+    """
+    import os as _os
+
+    # pymeshlab bundles Qt5, which tries to open a display at import time
+    # on Linux; the offscreen platform avoids that.
+    if "QT_QPA_PLATFORM" not in _os.environ:
+        _os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+    import pymeshlab
+
+    verts_in = np.asarray(mesh.vertices, dtype=np.float64)
+    faces_in = np.asarray(mesh.faces, dtype=np.int32)
+
+    ms = pymeshlab.MeshSet()
+    ms.add_mesh(pymeshlab.Mesh(vertex_matrix=verts_in, face_matrix=faces_in), "input")
+
+    ms.meshing_remove_duplicate_vertices()
+    ms.meshing_decimation_quadric_edge_collapse(
+        targetfacenum=target_faces,
+        optimalplacement=True,
+        preservenormal=True,
+        preservetopology=True,
+        qualitythr=0.5,
+    )
+    ms.meshing_remove_duplicate_faces()
+    ms.meshing_remove_unreferenced_vertices()
+
+    out = ms.current_mesh()
+    verts_out = np.asarray(out.vertex_matrix(), dtype=np.float64)
+    faces_out = np.asarray(out.face_matrix(), dtype=np.int32)
+
+    return trimesh.Trimesh(vertices=verts_out, faces=faces_out, process=False)
+
+
+def _simplify_pymeshlab_textured(
+    positions: np.ndarray,
+    faces: np.ndarray,
+    corner_uvs: np.ndarray,
+    texture_image: Image.Image,
+    target_faces: int,
+) -> trimesh.Trimesh:
+    """Texture-aware quadric decimation via PyMeshLab.
+
+    Decimating on geometry alone and reconstructing UV afterward (as
+    ``_simplify_pymeshlab`` does for the flat-colour path) breaks down for
+    models with multiple UV islands that sit close together in 3D -- e.g. a
+    helmet visor a few millimetres from the face, or straps against a shell.
+    A post-hoc nearest-position lookup can't tell which island a decimated
+    vertex belongs to and silently grabs whichever original corner happens
+    to be spatially closest, scrambling the texture at every such seam.
+
+    ``meshing_decimation_quadric_edge_collapse_with_texture`` avoids this by
+    folding UV distortion into the quadric error metric during collapse
+    itself, so wedge (per-face-corner) UVs stay coherent through
+    simplification instead of being reconstructed blind afterward.
+
+    PyMeshLab's raw ``pymeshlab.Mesh(..., w_tex_coords_matrix=...)``
+    constructor doesn't wire wedge UVs to a texture consistently -- the
+    filter then rejects the mesh ("some faces without texture") -- so the
+    merged mesh is round-tripped through a temporary OBJ/MTL instead, which
+    is the path PyMeshLab's own OBJ importer sets up correctly.
+    """
+    if len(faces) > target_faces:
+        import os as _os
+
+        if "QT_QPA_PLATFORM" not in _os.environ:
+            _os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+        import pymeshlab
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            tex_path = tmp_path / "texture.png"
+            texture_image.convert("RGB").save(tex_path)
+
+            obj_path = tmp_path / "merged.obj"
+            mtl_path = tmp_path / "merged.mtl"
+            with open(obj_path, "w") as f:
+                f.write(f"mtllib {mtl_path.name}\nusemtl m\n")
+                for x, y, z in positions:
+                    f.write(f"v {x:.9g} {y:.9g} {z:.9g}\n")
+                for u, v in corner_uvs:
+                    f.write(f"vt {u:.9g} {v:.9g}\n")
+                for i, (a, b, c) in enumerate(faces):
+                    t0, t1, t2 = 3 * i + 1, 3 * i + 2, 3 * i + 3
+                    f.write(f"f {a + 1}/{t0} {b + 1}/{t1} {c + 1}/{t2}\n")
+            mtl_path.write_text(f"newmtl m\nmap_Kd {tex_path.name}\n")
+
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(str(obj_path))
+            ms.meshing_decimation_quadric_edge_collapse_with_texture(
+                targetfacenum=target_faces,
+                preserveboundary=True,
+                optimalplacement=True,
+                preservenormal=True,
+                qualitythr=0.5,
+            )
+            out = ms.current_mesh()
+            positions = np.asarray(out.vertex_matrix(), dtype=np.float64)
+            faces = np.asarray(out.face_matrix(), dtype=np.int32)
+            corner_uvs = np.asarray(out.wedge_tex_coord_matrix(), dtype=np.float64)
+
+    # Wedge UVs are inherently per-face-corner; explode to one vertex per
+    # corner since trimesh's TextureVisuals expects per-vertex UV.
+    corner_positions = positions[faces.reshape(-1)]
+    mesh = trimesh.Trimesh(
+        vertices=corner_positions,
+        faces=np.arange(len(corner_positions)).reshape(-1, 3),
+        process=False,
+    )
+    material = trimesh.visual.material.SimpleMaterial(image=texture_image)
+    mesh.visual = trimesh.visual.TextureVisuals(uv=corner_uvs, material=material)
+    return mesh
+
+
 def write_lowpoly_preview(
     out_path: Path,
     pieces: list[RawMesh],
-    target_faces: int = 2000,
+    target_faces: int = 6000,
     texture_image: Image.Image | None = None,
+    source_mesh: RawMesh | WorkingMesh | None = None,
 ) -> tuple[int, int]:
     """Decimated single-mesh preview (docs/OUTPUT_FORMAT.md section 2 --
     UI only, not read by Unity). Returns (vertex_count, face_count).
 
-    All pieces are merged into one mesh -- welding shared piece-boundary
-    vertices together -- before decimating as a single pass, rather than
-    decimating each piece independently: independent per-piece decimation
-    moves each side of a shared seam on its own, tearing open gaps at
-    piece boundaries that used to be exactly coincident. Quadric edge
-    collapse never opens new holes in a mesh that's already
-    manifold/watertight at the seam, so welding first is what keeps the
-    result closed.
+    When `texture_image` is given and `source_mesh` carries UVs, the
+    preview is decimated straight from `source_mesh` -- the pre-slice,
+    post-ingest mesh, still one continuous surface per component -- via
+    ``_simplify_pymeshlab_textured``, which folds UV distortion into the
+    collapse metric itself. Puzzle pieces are deliberately *not* used here:
+    assembled pieces reconstruct the exact same geometry as `source_mesh`
+    (that's the slicer's whole invariant -- no gaps, no overlaps), so
+    merging pieces back together would only add puzzle-cut seams and the
+    artificial bridge geometry connecting originally-disconnected
+    components (a visor, straps, buckles) for no benefit, while making the
+    UV harder to keep coherent: a plain position-based weld followed by
+    nearest-neighbour UV reconstruction breaks down whenever the model has
+    UV islands that sit close together in 3D (e.g. a visor a few
+    millimetres from the face), silently scrambling the texture there.
 
-    Attributes don't survive decimation (trimesh's quadric decimation, a
-    thin wrapper around `fast_simplification`, drops vertex-colour/UV and
-    resets the result to flat default grey), so after decimating a plain
-    position/face mesh, each surviving vertex's colour or UV is pulled
-    from its nearest pre-decimation *face corner* -- not the nearest
-    pre-decimation *vertex*: a UV atlas seam puts multiple valid UVs at
-    the same welded position (one per island touching there), and
-    collapsing those onto a single vertex-indexed UV before the nearest-
-    neighbour lookup would silently keep only the last one written,
-    smearing every seam's texture across the wrong island. Matching by
-    corner instead means every candidate UV stays available, and the
-    lookup picks whichever corner is geometrically closest.
-
-    When `texture_image` is given and every piece carries source UVs, the
-    preview is textured with the model's original material instead of the
-    flat per-piece colours the "Combined" webapp viewer uses.
+    Otherwise the preview uses flat per-piece colours (the "Combined"
+    webapp viewer's convention), built from `pieces`: all pieces are
+    merged into one mesh -- welded by position, safe here since colour,
+    unlike UV, is uniform within a piece and doesn't smear across islands
+    the same way -- before decimating as a single pass with
+    ``_simplify_pymeshlab`` (independent per-piece decimation would move
+    each side of a shared seam on its own, tearing open gaps at piece
+    boundaries that used to be exactly coincident), and each surviving
+    vertex takes its nearest pre-decimation vertex's colour.
     """
     from .stage10 import region_colors
 
@@ -231,41 +355,38 @@ def write_lowpoly_preview(
         out_path.write_bytes(trimesh.Trimesh().export(file_type="glb"))
         return 0, 0
 
-    use_texture = texture_image is not None and all(
-        p.uvs is not None and p.faces_uv is not None for p in pieces
+    use_texture = (
+        texture_image is not None
+        and source_mesh is not None
+        and source_mesh.uvs is not None
+        and source_mesh.faces_uv is not None
     )
-    colours = region_colors(n_pieces)
-
-    positions_parts, faces_parts, colour_parts = [], [], []
-    corner_position_parts, corner_uv_parts = [], []
-    offset = 0
-    for i, piece in enumerate(pieces):
-        positions_parts.append(piece.positions)
-        faces_parts.append(piece.faces_pos + offset)
-        if use_texture:
-            corner_position_parts.append(piece.positions[piece.faces_pos.reshape(-1)])
-            corner_uv_parts.append(piece.uvs[piece.faces_uv.reshape(-1)])
-
-        r, g, b = colours[i]
-        rgba = np.array([[int(r * 255), int(g * 255), int(b * 255), 255]], dtype=np.uint8)
-        colour_parts.append(np.repeat(rgba, len(piece.positions), axis=0))
-        offset += len(piece.positions)
-
-    positions = np.concatenate(positions_parts, axis=0)
-    faces = np.concatenate(faces_parts, axis=0)
-    source_colours = np.concatenate(colour_parts, axis=0)
-
-    merged = trimesh.Trimesh(vertices=positions, faces=faces, process=True)
-    if len(merged.faces) > target_faces:
-        merged = merged.simplify_quadric_decimation(face_count=max(4, target_faces))
 
     if use_texture:
-        corner_positions = np.concatenate(corner_position_parts, axis=0)
-        corner_uvs = np.concatenate(corner_uv_parts, axis=0)
-        _, nearest_corner = cKDTree(corner_positions).query(merged.vertices, k=1)
-        material = trimesh.visual.material.SimpleMaterial(image=texture_image)
-        merged.visual = trimesh.visual.TextureVisuals(uv=corner_uvs[nearest_corner], material=material)
+        corner_uvs = source_mesh.uvs[source_mesh.faces_uv.reshape(-1)]
+        merged = _simplify_pymeshlab_textured(
+            source_mesh.positions, source_mesh.faces_pos, corner_uvs, texture_image, target_faces
+        )
     else:
+        positions_parts, faces_parts, colour_parts = [], [], []
+        colours = region_colors(n_pieces)
+        offset = 0
+        for i, piece in enumerate(pieces):
+            positions_parts.append(piece.positions)
+            faces_parts.append(piece.faces_pos + offset)
+            r, g, b = colours[i]
+            rgba = np.array([[int(r * 255), int(g * 255), int(b * 255), 255]], dtype=np.uint8)
+            colour_parts.append(np.repeat(rgba, len(piece.positions), axis=0))
+            offset += len(piece.positions)
+
+        positions = np.concatenate(positions_parts, axis=0)
+        faces = np.concatenate(faces_parts, axis=0)
+        source_colours = np.concatenate(colour_parts, axis=0)
+
+        merged = trimesh.Trimesh(vertices=positions, faces=faces, process=True)
+        if len(merged.faces) > target_faces:
+            merged = _simplify_pymeshlab(merged, max(4, target_faces))
+
         _, nearest_vertex = cKDTree(positions).query(merged.vertices, k=1)
         merged.visual = trimesh.visual.ColorVisuals(mesh=merged, vertex_colors=source_colours[nearest_vertex])
 

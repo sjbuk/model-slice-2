@@ -148,18 +148,21 @@ def test_lowpoly_preview_does_not_tear_piece_seams(tmp_path):
 
 
 def test_lowpoly_preview_uses_original_uv_when_texture_given(tmp_path):
-    """When a texture image is supplied and every piece carries source UVs,
-    the preview is textured with it instead of flat per-piece colours."""
+    """When a texture image is supplied and source_mesh carries UVs, the
+    preview is decimated straight from source_mesh and textured with it,
+    instead of flat per-piece colours built from the sliced pieces."""
     from PIL import Image
 
     result = run_pipeline(fixture_c_shirt(), n_pieces=6)
     texture = Image.new("RGB", (4, 4), (255, 0, 0))
-    for piece in result.pieces:
-        piece.uvs = np.zeros((len(piece.positions), 2), dtype=np.float64)
-        piece.faces_uv = piece.faces_pos.copy()
+    working = result.working
+    working.uvs = np.zeros((len(working.positions), 2), dtype=np.float64)
+    working.faces_uv = working.faces_pos.copy()
 
     out_path = tmp_path / "lowpoly_preview.glb"
-    write_lowpoly_preview(out_path, result.pieces, target_faces=120, texture_image=texture)
+    write_lowpoly_preview(
+        out_path, result.pieces, target_faces=120, texture_image=texture, source_mesh=working
+    )
 
     mesh = trimesh.load(out_path, force="mesh")
     assert isinstance(mesh.visual, trimesh.visual.TextureVisuals)

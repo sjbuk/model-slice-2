@@ -290,10 +290,11 @@ def save_job(job_id):
 
     piece_count = job["response"]["piece_count"]
     pieces = [load_obj(str(job_dir / f"piece_{i:02d}.obj")) for i in range(piece_count)]
+    working_mesh = load_obj(str(job_dir / "working.obj"))
     source_path = job_dir / job["source_name"]
     texture_image = extract_base_color_image(source_path)
     lowpoly_vertices, lowpoly_faces = write_lowpoly_preview(
-        job_dir / "lowpoly_preview.glb", pieces, texture_image=texture_image
+        job_dir / "lowpoly_preview.glb", pieces, texture_image=texture_image, source_mesh=working_mesh
     )
 
     checkpoint_path = job_dir / "checkpoint.json"

@@ -78,6 +78,7 @@ def main() -> None:
 
         for i, piece in enumerate(result.pieces):
             save_obj(str(job_dir / f"piece_{i:02d}.obj"), piece)
+        save_obj(str(job_dir / "working.obj"), result.working)
         write_preview_obj(
             str(job_dir / "preview.obj"),
             str(job_dir / "preview.mtl"),
